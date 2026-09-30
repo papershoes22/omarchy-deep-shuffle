@@ -534,6 +534,8 @@ Panel {
     function sync(): void { root.syncNow() }
     // omarchy-shell io.github.papershoes22.sclikes search "hucci"   (full player, filtered)
     function search(q: string): void { root.query = q; root.setExpanded(true) }
+    // omarchy-shell io.github.papershoes22.sclikes artist "Artist Name"   (full player, that artist's likes)
+    function artist(name: string): void { root.artistFilter = name; root.setExpanded(true) }
     // omarchy-shell io.github.papershoes22.sclikes playPause | next | prev | stop
     function playPause(): void { root.playPause() }
     function next(): void { root.next() }

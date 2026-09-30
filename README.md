@@ -1,5 +1,7 @@
 # SoundCloud Likes Player (Omarchy plugin)
 
+![The full player, filtered to one artist](preview.png)
+
 A player for your SoundCloud likes that lives in the Omarchy bar. It pulls your likes into a local library
 and plays them with mpv. Searching, shuffling, the EQ and media keys work the same whether a track streams or
 is stored locally.
@@ -103,7 +105,7 @@ The panel talks to the daemon over `~/.local/state/sclikes/ctl.sock` (JSON lines
   media bindings and OSD, and `playerctl`, all see it.
 - **CLI:** `sclikes --help` (play, pause, next, seek, vol, shuffle, repeat, now, queue, eq, sync, export, stats, …).
 - **IPC** for hotkeys: `omarchy-shell io.github.papershoes22.sclikes open|close|toggle|expand|collapse|playPause|next|prev|stop|sync|togglePlayOn`,
-  `… search "<text>"` and `… playOn here|remote`.
+  `… search "<text>"`, `… artist "<name>"` and `… playOn here|remote`.
 
 ## Archiving (optional)
 
