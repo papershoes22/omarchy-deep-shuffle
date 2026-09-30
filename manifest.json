@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.papershoes22.sclikes",
+  "name": "SoundCloud Likes Player",
+  "version": "0.1.0",
+  "author": "papershoes22",
+  "license": "MIT",
+  "description": "A player for your SoundCloud likes, in the bar. The pill shows what's playing, with a progress line; the dropdown has cover art, a scrubber, transport and volume, a 10-band EQ, what's up next, and a full library window with search. Optional: keep local copies of your likes (off by default), and play on another machine with this one as the remote. Runs in the bundled `sclikes` user service (mpv + yt-dlp).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "SoundCloud Likes Player",
+    "description": "Now playing from your SoundCloud likes, with a player dropdown and a full library window.",
+    "category": "Media",
+    "aliases": [
+      "soundcloud",
+      "music",
+      "player",
+      "likes",
+      "sclikes",
+      "mpv"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "maxWidth": 200,
+      "showTitle": "On",
+      "pillVisualizer": "On",
+      "narrowMaxWidth": 80,
+      "pillStyle": "Vivid",
+      "barGlow": "Off"
+    },
+    "schema": [
+      {
+        "key": "maxWidth",
+        "type": "integer",
+        "label": "Max title width in the pill (px; longer titles scroll)",
+        "min": 60,
+        "max": 600,
+        "step": 20,
+        "defaultValue": 200
+      },
+      {
+        "key": "narrowMaxWidth",
+        "type": "integer",
+        "label": "Max title width on narrow screens (under 1600 px wide)",
+        "min": 0,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 80
+      },
+      {
+        "key": "showTitle",
+        "type": "enum",
+        "label": "Show artist – title in the pill",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On"
+      },
+      {
+        "key": "pillVisualizer",
+        "type": "enum",
+        "label": "Mini spectrum in the pill (costs CPU while playing): On, External (not the laptop screen) or Off",
+        "options": [
+          "On",
+          "External",
+          "Off"
+        ],
+        "defaultValue": "On"
+      },
+      {
+        "key": "pillStyle",
+        "type": "enum",
+        "label": "Pill look: Vivid (cover-art colours, cover thumbnail, bass glow) or Classic (plain bar text)",
+        "options": [
+          "Vivid",
+          "Classic"
+        ],
+        "defaultValue": "Vivid"
+      },
+      {
+        "key": "barGlow",
+        "type": "enum",
+        "label": "Glow across the whole bar while playing, pulsing on heavy beats (costs CPU): On, External (not the laptop screen) or Off",
+        "options": [
+          "On",
+          "External",
+          "Off"
+        ],
+        "defaultValue": "Off"
+      }
+    ]
+  }
+}

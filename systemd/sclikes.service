@@ -1,0 +1,18 @@
+[Unit]
+Description=sclikes: SoundCloud likes player (mpv) + optional archiver
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sclikes daemon
+Restart=on-failure
+RestartSec=30
+# SIGTERM only the daemon (it quits mpv itself and gives the current download up to 30s);
+# leftovers (ffmpeg) get SIGKILL. .part files resume.
+KillMode=mixed
+TimeoutStopSec=45
+# the archive thread lowers its own nice/IO priority; mpv playback stays at normal priority
+
+[Install]
+WantedBy=default.target

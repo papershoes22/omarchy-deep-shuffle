@@ -1,0 +1,2530 @@
+#!/usr/bin/env python3
+"""sclikes: a player for your SoundCloud likes, with an optional local archive.
+
+Setup:
+  sclikes config user <name>         your SoundCloud profile name (soundcloud.com/<name>)
+  sclikes config archive on|off      keep local copies of your likes (off by default: tracks stream)
+  sclikes config remote <ssh-host>   optional: another machine running sclikes, to play on from here
+  sclikes config                     show the settings (~/.config/sclikes/config.json)
+
+Commands:
+  sclikes sync [--full] [--export]   pull likes into the DB (incremental; --full reconciles unlikes,
+                                     automatic when the last full sync is over 7 days old)
+  sclikes export [--format F]        write M3U / CSV / JSON of the library
+  sclikes stats                      counts by status
+  sclikes archive run [--limit N]    download queued tracks in the foreground
+  sclikes archive run --id ID        archive one specific track now
+  sclikes archive pause|resume       pause/resume the daemon's archive worker
+  sclikes archive retry              requeue failed tracks
+  sclikes audit [--fix] [--recheck]  verify files vs DB; --recheck re-queries gone/preview/failed tracks
+  sclikes daemon                     long-running worker: archive queue (thread) + player
+  sclikes play-on [here|remote]      where the music plays; on "remote" this machine is only the remote control
+                                     (sclikes-remote.service relays to the remote machine's daemon over ssh)
+
+Player (talks to the daemon over ~/.local/state/sclikes/ctl.sock; mpv --idle does the audio):
+  sclikes play [ID] [-q Q] [--artist A] [--genre G] [--view V] [--sort S] [--local] [--shuffle|--no-shuffle]
+                                     no args: resume; ID/filters: build a new queue (liked order)
+  sclikes pause [--on|--off]         toggle (starts playback when stopped)
+  sclikes stop | next | prev
+  sclikes seek +10|-10|90|1:30|50%
+  sclikes vol +5|-5|60
+  sclikes shuffle [on|off|toggle]    sclikes repeat [off|all|one]
+  sclikes now [--json]               sclikes queue [-n N]
+  sclikes eq [PRESET] [--band N --gain DB]   10-band equalizer (live, saved)
+
+Files:
+  ~/.local/share/sclikes/likes.db     SQLite library
+  ~/.local/state/sclikes/state.json   live state for the bar plugin
+  ~/Music/soundcloud/                 audio library: <Artist>/<Title> [<id>].<ext> + .jpg + .info.json
+  ~/Music/soundcloud/_exports/        exports
+"""
+
+import argparse
+import csv
+import ctypes
+import fcntl
+import json
+import os
+import queue
+import random
+import re
+import shlex
+import shutil
+import signal
+import socket
+import socketserver
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+USERNAME = os.environ.get("SCLIKES_USER")  # overrides the config file's "user"
+PLUGIN_ID = "io.github.papershoes22.sclikes"
+CONFIG_PATH = HOME / ".config/sclikes/config.json"   # {"user": str, "archive": bool, "remote": ssh host}
+CONFIG_DEFAULTS = {"user": "", "archive": False, "remote": ""}
+
+
+def load_config():
+    try:
+        c = json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        c = {}
+    return {**CONFIG_DEFAULTS, **(c if isinstance(c, dict) else {})}
+
+
+def archiving_on():
+    """Archiving is opt-in: with it off, likes stream from SoundCloud and nothing is downloaded,
+    except tracks asked for one at a time with "Archive now"."""
+    return bool(load_config()["archive"])
+DATA_DIR = HOME / ".local/share/sclikes"
+DB_PATH = DATA_DIR / "likes.db"
+LIBRARY_DIR = HOME / "Music/soundcloud"
+EXPORT_DIR = LIBRARY_DIR / "_exports"
+STATE_DIR = HOME / ".local/state/sclikes"
+STATE_PATH = STATE_DIR / "state.json"
+SYNC_STATE = STATE_DIR / "sync.json"  # written by `sync` (its own file: the daemon rewrites state.json every second)
+LOCK_PATH = STATE_DIR / "archive.lock"
+MPV_SOCK = STATE_DIR / "mpv.sock"
+CTL_SOCK = STATE_DIR / "ctl.sock"
+
+AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".flac", ".wav", ".aiff", ".aif", ".aac"}
+# original upload if the artist allows downloads, else best AAC, else whatever is best
+FORMAT = "download/hls_aac_160k/bestaudio[acodec^=mp4a]/bestaudio"
+DOWNLOAD_SLEEP = (4.0, 7.0)   # seconds between tracks
+MAX_ATTEMPTS = 3              # then status=failed
+RATE_LIMIT_SLEEP = 900        # on HTTP 429
+IDLE_POLL = 600               # daemon: recheck an empty queue this often
+FULL_SYNC_EVERY = 7 * 86400
+ARCHIVE_STOP_WAIT = 30        # daemon shutdown: max wait for the current download (unit allows 45)
+
+PAGE_SIZE = 200
+PAGE_SLEEP = 1.5  # be polite between API pages
+MAX_RETRIES = 5
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tracks (
+  sc_id        INTEGER PRIMARY KEY,
+  title        TEXT,
+  artist       TEXT,
+  permalink    TEXT,
+  artwork      TEXT,
+  duration     INTEGER,            -- ms (full track length)
+  liked_at     TEXT,               -- ISO8601 UTC
+  genre        TEXT,
+  purchase_url TEXT,
+  status       TEXT NOT NULL DEFAULT 'linked',  -- linked|archived|preview_only|gone|drm|failed
+  unliked      INTEGER NOT NULL DEFAULT 0,
+  local_path   TEXT,
+  codec        TEXT,
+  bitrate      INTEGER,
+  last_checked TEXT,
+  play_count   INTEGER NOT NULL DEFAULT 0,
+  policy       TEXT,               -- SoundCloud policy: ALLOW|MONETIZE|SNIP|BLOCK
+  meta         TEXT                -- raw track JSON from the API
+);
+CREATE INDEX IF NOT EXISTS tracks_liked_at ON tracks(liked_at DESC);
+CREATE INDEX IF NOT EXISTS tracks_status ON tracks(status);
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+"""
+
+MIGRATIONS = {  # column -> DDL, added if missing
+    "attempts": "ALTER TABLE tracks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "error": "ALTER TABLE tracks ADD COLUMN error TEXT",
+    "archived_at": "ALTER TABLE tracks ADD COLUMN archived_at TEXT",
+    "art_color": "ALTER TABLE tracks ADD COLUMN art_color TEXT",  # '#rrggbb', '' = no clear color, NULL = not computed
+}
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def db_connect(threaded=False):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=not threaded)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(SCHEMA)
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(tracks)")}
+    for col, ddl in MIGRATIONS.items():
+        if col not in cols:
+            con.execute(ddl)
+    con.commit()
+    return con
+
+
+def kv_set(con, k, v):
+    con.execute("INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+
+
+def kv_get(con, k, default=None):
+    row = con.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return row["v"] if row else default
+
+
+# ---------------------------------------------------------------- SoundCloud API
+
+class SoundCloud:
+    """Thin wrapper over yt-dlp's SoundCloud extractor (client_id discovery + requests)."""
+
+    def __init__(self):
+        import yt_dlp
+        from yt_dlp.utils import ExtractorError
+        self.ExtractorError = ExtractorError
+        self.ydl = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True})
+        self.ie = self.ydl.get_info_extractor("SoundcloudUser")
+        self.ie.initialize()
+
+    def _get(self, url, query=None, note="api"):
+        delay = 5
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return self.ie._call_api(
+                    url, note, query=query or {}, headers=self.ie._HEADERS,
+                    impersonate=self.ie._browser_impersonate_target)
+            except self.ExtractorError as e:
+                if attempt == MAX_RETRIES:
+                    raise
+                log(f"  request failed ({e.msg.splitlines()[0][:120]}); retry {attempt} in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
+
+    def user_id(self, username):
+        u = self._get(self.ie._resolv_url(self.ie._BASE_URL + username), note="user")
+        return u["id"], u.get("likes_count")
+
+    def tracks(self, ids):
+        """Fetch track objects by id (batches of 50). Missing ids are deleted/private."""
+        out = {}
+        ids = list(ids)
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            resp = self._get(self.ie._API_V2_BASE + "tracks",
+                             query={"ids": ",".join(map(str, chunk))}, note="tracks")
+            for t in resp or []:
+                out[t["id"]] = t
+            time.sleep(PAGE_SLEEP)
+        return out
+
+    def likes(self, user_id):
+        """Yield like entries ({created_at, kind, track|playlist}) newest first."""
+        url = self.ie._API_V2_BASE + f"users/{user_id}/likes"
+        query = {"limit": PAGE_SIZE, "linked_partitioning": "1"}
+        page = 0
+        while url:
+            page += 1
+            resp = self._get(url, query=query, note=f"likes page {page}")
+            yield from resp.get("collection") or []
+            url = resp.get("next_href")
+            query = {}  # next_href carries the cursor; client_id is re-added by _call_api
+            if url:
+                time.sleep(PAGE_SLEEP)
+
+
+def status_from_policy(track):
+    policy = track.get("policy")
+    if policy == "SNIP":
+        return "preview_only"
+    if policy == "BLOCK" or track.get("streamable") is False:
+        return "gone"
+    return "linked"
+
+
+def track_row(entry):
+    t = entry["track"]
+    user = t.get("user") or {}
+    return {
+        "sc_id": t["id"],
+        "title": t.get("title"),
+        "artist": user.get("username") or (t.get("publisher_metadata") or {}).get("artist"),
+        "permalink": t.get("permalink_url"),
+        "artwork": t.get("artwork_url") or user.get("avatar_url"),
+        "duration": t.get("full_duration") or t.get("duration"),
+        "liked_at": entry.get("created_at"),
+        "genre": t.get("genre") or None,
+        "purchase_url": t.get("purchase_url"),
+        "policy": t.get("policy"),
+        "status": status_from_policy(t),
+        "meta": json.dumps(t, separators=(",", ":")),
+    }
+
+
+UPSERT = """
+INSERT INTO tracks (sc_id, title, artist, permalink, artwork, duration, liked_at, genre,
+                    purchase_url, policy, status, meta, unliked, last_checked)
+VALUES (:sc_id, :title, :artist, :permalink, :artwork, :duration, :liked_at, :genre,
+        :purchase_url, :policy, :status, :meta, 0, :now)
+ON CONFLICT(sc_id) DO UPDATE SET
+  title=excluded.title, artist=excluded.artist, permalink=excluded.permalink,
+  artwork=excluded.artwork, duration=excluded.duration, liked_at=excluded.liked_at,
+  genre=excluded.genre, purchase_url=excluded.purchase_url, policy=excluded.policy,
+  meta=excluded.meta, unliked=0, last_checked=excluded.last_checked,
+  -- keep archive results; only refresh status for tracks not yet archived/failed
+  status=CASE WHEN tracks.status IN ('archived', 'failed') THEN tracks.status ELSE excluded.status END
+"""
+
+
+# ---------------------------------------------------------------- commands
+
+def write_sync_state(**data):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SYNC_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(SYNC_STATE)
+
+
+def cmd_sync(args):
+    write_sync_state(state="running", started=now_iso(), pid=os.getpid())
+    try:
+        res = _sync(args)
+    except BaseException as e:
+        write_sync_state(state="error", at=now_iso(), error=str(e) or type(e).__name__)
+        raise
+    write_sync_state(state="done", at=now_iso(), **res)
+
+
+def _wake_archiver(con, new_ids):
+    """Queue fresh likes ahead of the 10-min idle poll, unless the archive is paused."""
+    if not new_ids or not archiving_on() or kv_get(con, "archive_paused") == "1" or not CTL_SOCK.exists():
+        return
+    ids = [r[0] for r in con.execute(
+        f"SELECT sc_id FROM tracks WHERE status='linked' AND sc_id IN ({','.join('?' * len(new_ids))})",
+        list(new_ids))]
+    for sid in ids:
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(10)
+                s.connect(str(CTL_SOCK))
+                s.sendall(json.dumps({"cmd": "archive_now", "args": {"sc_id": sid}}).encode() + b"\n")
+                s.makefile("rb").readline()
+        except OSError as e:
+            log(f"couldn't wake the archiver: {e}")
+            return
+    if ids:
+        log(f"asked the daemon to archive {len(ids)} new track(s)")
+
+
+def _sync(args):
+    con = db_connect()
+    sc = SoundCloud()
+    user = args.user or USERNAME or load_config()["user"]
+    if not user:
+        raise SystemExit("no SoundCloud user set: run `sclikes config user <your-profile-name>`")
+    uid, total = sc.user_id(user)
+    log(f"user {user} (id {uid}), {total} likes reported")
+    known = {r[0] for r in con.execute("SELECT sc_id FROM tracks WHERE unliked=0")}
+    full = args.full or not known or _full_sync_due(con)
+    seen, new, skipped_playlists, new_ids = set(), 0, 0, []
+    now = now_iso()
+    for entry in sc.likes(uid):
+        if "track" not in entry or not entry.get("track"):
+            skipped_playlists += 1
+            continue
+        row = track_row(entry)
+        sid = row["sc_id"]
+        if not full and sid in known:
+            log(f"reached known track {sid}; stopping (incremental)")
+            break
+        if sid not in known:
+            new += 1
+            new_ids.append(sid)
+        seen.add(sid)
+        con.execute(UPSERT, {**row, "now": now})
+        if len(seen) % PAGE_SIZE == 0:
+            con.commit()
+            log(f"  {len(seen)} tracks...")
+    unliked = 0
+    if full:
+        gone = known - seen
+        if gone:
+            con.executemany("UPDATE tracks SET unliked=1 WHERE sc_id=?", [(i,) for i in gone])
+            unliked = len(gone)
+    kv_set(con, "last_sync", now)
+    if full:
+        kv_set(con, "last_full_sync", now)
+    con.commit()
+    log(f"sync done: {len(seen)} seen, {new} new, {unliked} newly unliked, "
+        f"{skipped_playlists} playlist likes skipped")
+    res = {"seen": len(seen), "new": new, "unliked": unliked,
+           "playlists_skipped": skipped_playlists, "full": full}
+    print(json.dumps(res))
+    _wake_archiver(con, new_ids)
+    if args.export:
+        cmd_export(argparse.Namespace(out=str(EXPORT_DIR), format="all", include_unliked=False))
+    return res
+
+
+def _full_sync_due(con):
+    last = kv_get(con, "last_full_sync")
+    if not last:
+        return True
+    age = time.time() - datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    return age > FULL_SYNC_EVERY
+
+
+EXPORT_FIELDS = ["sc_id", "artist", "title", "permalink", "duration", "liked_at", "genre",
+                 "status", "unliked", "purchase_url", "local_path", "artwork"]
+
+
+def export_rows(con, include_unliked):
+    where = "" if include_unliked else "WHERE unliked=0"
+    return [dict(r) for r in con.execute(
+        f"SELECT {', '.join(EXPORT_FIELDS)} FROM tracks {where} ORDER BY liked_at DESC")]
+
+
+def cmd_export(args):
+    con = db_connect()
+    rows = export_rows(con, args.include_unliked)
+    out = Path(args.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    formats = ["m3u", "csv", "json"] if args.format == "all" else [args.format]
+    written = []
+    for fmt in formats:
+        path = out / f"likes.{fmt}"
+        if fmt == "m3u":
+            with path.open("w") as f:
+                f.write("#EXTM3U\n")
+                for r in rows:
+                    secs = (r["duration"] or 0) // 1000 or -1
+                    f.write(f"#EXTINF:{secs},{r['artist']} - {r['title']}\n")
+                    lp = r["local_path"]
+                    f.write(f"{lp if lp and Path(lp).exists() else r['permalink']}\n")
+        elif fmt == "csv":
+            with path.open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=EXPORT_FIELDS)
+                w.writeheader()
+                w.writerows(rows)
+        elif fmt == "json":
+            path.write_text(json.dumps(rows, indent=1, ensure_ascii=False))
+        written.append(str(path))
+    log(f"exported {len(rows)} tracks")
+    print("\n".join(written))
+
+
+def cmd_stats(args):
+    con = db_connect()
+    total = con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+    print(f"tracks: {total}")
+    for r in con.execute("SELECT status, unliked, COUNT(*) n FROM tracks GROUP BY 1, 2 ORDER BY n DESC"):
+        print(f"  {r['status']:<13}{' (unliked)' if r['unliked'] else '':<11}{r['n']}")
+    hours = (con.execute("SELECT SUM(duration) FROM tracks WHERE unliked=0").fetchone()[0] or 0) / 3.6e6
+    print(f"total duration: {hours:.1f} h")
+    print(f"last sync: {kv_get(con, 'last_sync', 'never')}  last full: {kv_get(con, 'last_full_sync', 'never')}")
+
+
+# ---------------------------------------------------------------- state.json
+
+_state_lock = threading.Lock()  # archive thread and player both write sections
+
+
+def write_state(section, data):
+    """Merge `data` under `section` into state.json atomically."""
+    with _state_lock:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            state = json.loads(STATE_PATH.read_text())
+        except (OSError, ValueError):
+            state = {}
+        state[section] = data
+        state["updated"] = now_iso()
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False))
+        tmp.replace(STATE_PATH)
+
+
+def archive_counts(con):
+    c = {r["status"]: r["n"] for r in con.execute(
+        "SELECT status, COUNT(*) n FROM tracks WHERE unliked=0 GROUP BY status")}
+    c["total"] = sum(c.values())
+    c["queued"] = con.execute(
+        "SELECT COUNT(*) FROM tracks WHERE unliked=0 AND status='linked'").fetchone()[0]
+    return c
+
+
+# ---------------------------------------------------------------- archiving
+
+class RateLimited(Exception):
+    pass
+
+
+def safe_name(s, maxlen=120):
+    s = re.sub(r'[/\\\x00-\x1f]', "_", (s or "").strip()) or "Unknown"
+    s = s.lstrip(".") or "_"
+    while len(s.encode()) > maxlen:
+        s = s[:-1]
+    return s.rstrip()
+
+
+def probe_duration(path):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=60)
+        return float(out.stdout.strip())
+    except (ValueError, subprocess.SubprocessError):
+        return None
+
+
+def classify_error(msg):
+    # Drop yt-dlp's "[soundcloud] <track id>:" prefix: ids like 1214294914 contain "429"/"404".
+    m = re.sub(r"^\s*(error:\s*)?\[[^\]]*\]\s*\d+:\s*", "", msg.lower())
+    if "drm protected" in m:  # only encrypted streams; clear ones 404 anonymously
+        return "drm"
+    if re.search(r"http error 429|\b429\b|too many requests", m):
+        return "rate_limited"
+    if re.search(r"http error 404|\b404\b", m) or any(k in m for k in (
+            "not available", "not found", "has been removed", "geo restrict", "no video formats",
+            "requested format is not available")):
+        return "gone"
+    return "error"
+
+
+ARCHIVE_WAKE = threading.Event()  # set by `archive_now` to cut the worker's sleep short
+
+
+def archive_priority(con):
+    try:
+        return [int(i) for i in json.loads(kv_get(con, "archive_priority") or "[]")]
+    except ValueError:
+        return []
+
+
+def next_queued(con):
+    """Tracks asked for with `archive_now` first, then the regular queue."""
+    prio = archive_priority(con)
+    while prio:
+        row = con.execute("SELECT * FROM tracks WHERE sc_id=? AND status IN ('linked', 'failed')",
+                          (prio.pop(0),)).fetchone()
+        kv_set(con, "archive_priority", json.dumps(prio))
+        con.commit()
+        if row:
+            return row
+    return con.execute("SELECT * FROM tracks WHERE unliked=0 AND status='linked' "
+                       "ORDER BY attempts, liked_at DESC LIMIT 1").fetchone()
+
+
+def nap(stop, secs):
+    """Sleep up to `secs`; wakes early on stop or ARCHIVE_WAKE."""
+    end = time.monotonic() + secs
+    while not stop.is_set() and not ARCHIVE_WAKE.is_set() and (left := end - time.monotonic()) > 0:
+        stop.wait(min(1.0, left))
+    ARCHIVE_WAKE.clear()
+
+
+def download_track(row):
+    """Download one track. Returns (filepath, info). Raises yt_dlp DownloadError."""
+    import yt_dlp
+    from yt_dlp.postprocessor import EmbedThumbnailPP
+    base = LIBRARY_DIR / safe_name(row["artist"]) / f"{safe_name(row['title'])} [{row['sc_id']}]"
+    opts = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "format": FORMAT,
+        "outtmpl": str(base).replace("%", "%%") + ".%(ext)s",
+        "writethumbnail": True, "writeinfojson": True,
+        "retries": 5, "fragment_retries": 10,
+        "postprocessors": [
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
+            {"key": "FFmpegMetadata", "add_metadata": True},
+        ],
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(row["permalink"], download=True)
+        info = ydl.sanitize_info(info)
+        fp = Path(info["requested_downloads"][0]["filepath"])
+        info["filepath"] = str(fp)
+        thumbs = [t for t in info.get("thumbnails") or [] if t.get("filepath")]
+        if fp.suffix in (".m4a", ".mp3") and thumbs:
+            try:  # mutagen isn't installed; yt-dlp falls back to ffmpeg for m4a/mp3
+                EmbedThumbnailPP(ydl, already_have_thumbnail=True).run(info)
+            except Exception as e:  # art stays as the .jpg sidecar
+                log(f"  embed art failed: {e}")
+    return fp, info
+
+
+def archive_one(con, row):
+    """Archive a single track and update its row. Returns the new status."""
+    import yt_dlp
+    sid = row["sc_id"]
+    now = now_iso()
+    try:
+        fp, info = download_track(row)
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e).replace("ERROR: ", "")[:500]
+        kind = classify_error(msg)
+        if kind == "rate_limited":
+            raise RateLimited(msg)
+        attempts = row["attempts"] + 1
+        status = kind if kind in ("gone", "drm") else ("failed" if attempts >= MAX_ATTEMPTS else "linked")
+        con.execute("UPDATE tracks SET status=?, attempts=?, error=?, last_checked=? WHERE sc_id=?",
+                    (status, attempts, msg, now, sid))
+        con.commit()
+        return status
+
+    dur = probe_duration(fp)
+    expected = (row["duration"] or 0) / 1000
+    if dur and dur < 35 and expected > 40:  # a Go+ snippet slipped through
+        for f in fp.parent.glob(f"*[[]{sid}[]]*"):
+            f.unlink(missing_ok=True)
+        con.execute("UPDATE tracks SET status='preview_only', error=?, last_checked=? WHERE sc_id=?",
+                    (f"got {dur:.0f}s of {expected:.0f}s", now, sid))
+        con.commit()
+        return "preview_only"
+
+    con.execute("""UPDATE tracks SET status='archived', local_path=?, codec=?, bitrate=?, error=NULL,
+                   archived_at=?, last_checked=? WHERE sc_id=?""",
+                (str(fp), info.get("acodec") or fp.suffix[1:],
+                 int(info["abr"]) if info.get("abr") else None, now, now, sid))
+    con.commit()
+    return "archived"
+
+
+class ArchiveLock:
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.f = open(LOCK_PATH, "w")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("another archiver holds the lock (is the sclikes daemon running? "
+                     "use `sclikes archive pause`, or stop sclikes.service)")
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def archive_loop(stop, limit=None, daemon=False):
+    """Work the queue until `stop` (a threading.Event) is set or `limit` tracks are done."""
+    con = db_connect()
+    done = 0
+    last = {}
+
+    def publish(current=None, **extra):
+        write_state("archive", {"counts": archive_counts(con), "current": current,
+                                "paused": kv_get(con, "archive_paused") == "1",
+                                "priority": archive_priority(con),
+                                "last": last, "pid": os.getpid(), **extra})
+
+    while not stop.is_set() and (limit is None or done < limit):
+        if daemon and not archiving_on() and not archive_priority(con):
+            publish(state="off")
+            nap(stop, 10)
+            continue
+        if daemon and kv_get(con, "archive_paused") == "1" and not archive_priority(con):
+            publish(state="paused")
+            nap(stop, 10)
+            continue
+        row = next_queued(con)
+        if not row:
+            if not daemon:
+                break
+            publish(state="idle")
+            nap(stop, IDLE_POLL)
+            continue
+        cur = {"sc_id": row["sc_id"], "artist": row["artist"], "title": row["title"]}
+        publish(current=cur, state="downloading")
+        log(f"[{row['sc_id']}] {row['artist']} - {row['title']}")
+        try:
+            status = archive_one(con, row)
+        except RateLimited as e:
+            log(f"  rate limited; sleeping {RATE_LIMIT_SLEEP}s")
+            publish(state="rate_limited", error=str(e)[:200],
+                    until=datetime.fromtimestamp(time.time() + RATE_LIMIT_SLEEP, timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"))
+            stop.wait(RATE_LIMIT_SLEEP)
+            continue
+        err = con.execute("SELECT error FROM tracks WHERE sc_id=?", (row["sc_id"],)).fetchone()[0]
+        log(f"  -> {status}" + (f" ({err[:120]})" if err and status != "archived" else ""))
+        last = {**cur, "status": status, "at": now_iso()}
+        done += 1
+        publish(state="sleeping")
+        nap(stop, random.uniform(*DOWNLOAD_SLEEP))
+    publish(state="stopped" if daemon else "idle")
+    return done
+
+
+def cmd_archive(args):
+    con = db_connect()
+    if args.action == "pause":
+        kv_set(con, "archive_paused", "1"); con.commit(); print("paused")
+    elif args.action == "resume":
+        kv_set(con, "archive_paused", "0"); con.commit(); print("resumed")
+    elif args.action == "retry":
+        n = con.execute("UPDATE tracks SET status='linked', attempts=0, error=NULL "
+                        "WHERE status='failed' AND unliked=0").rowcount
+        con.commit(); print(f"requeued {n} failed tracks")
+    elif args.action == "status":
+        print(json.dumps(archive_counts(con)))
+    elif args.id:
+        row = con.execute("SELECT * FROM tracks WHERE sc_id=?", (args.id,)).fetchone()
+        if not row:
+            sys.exit(f"unknown track {args.id}")
+        if CTL_SOCK.exists():
+            try:
+                print(json.dumps(ctl("archive_now", sc_id=args.id)))
+                return
+            except SystemExit as e:
+                if "isn't running" not in str(e):
+                    raise
+        with ArchiveLock():
+            log(f"[{row['sc_id']}] {row['artist']} - {row['title']}")
+            print(archive_one(con, row))
+    else:
+        stop = threading.Event()
+
+        def on_term(*_):
+            if stop.is_set():
+                raise SystemExit(0)  # second signal: abort the current download
+            stop.set()
+            log("stopping after the current track (signal again to abort)")
+        signal.signal(signal.SIGTERM, on_term)
+        with ArchiveLock():
+            n = archive_loop(stop, limit=args.limit)
+        log(f"archived batch of {n}")
+
+
+def lower_thread_priority():
+    """nice 10 + idle IO class for the calling thread only (children like ffmpeg inherit it)."""
+    tid = threading.get_native_id()
+    try:
+        os.setpriority(os.PRIO_PROCESS, tid, 10)
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall(251, 1, tid, 3 << 13)  # SYS_ioprio_set (x86_64), IOPRIO_WHO_PROCESS, CLASS_IDLE
+    except OSError as e:
+        log(f"could not lower archive thread priority: {e}")
+
+
+def archive_worker(stop):
+    lower_thread_priority()
+    while not stop.is_set():
+        try:
+            archive_loop(stop, daemon=True)
+        except Exception:
+            log("archive worker crashed; restarting in 60s\n" + traceback.format_exc())
+            stop.wait(60)
+
+
+def cmd_daemon(args):
+    stop = threading.Event()
+    with ArchiveLock():
+        player = Player()
+        player.start()
+        mpris = None
+        try:
+            mpris = Mpris(player)
+            mpris.start()
+        except ImportError as e:
+            log(f"mpris: python-gobject missing ({e}); media keys won't reach sclikes")
+        viz = Visualizer()
+        player.on_publish.append(viz.update)
+        server = ControlServer(player)
+        server.viz = viz
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        worker = threading.Thread(target=archive_worker, args=(stop,), daemon=True, name="archive")
+        worker.start()
+
+        def on_term(*_):
+            if stop.is_set():
+                os._exit(0)  # second signal: abort the current download
+            stop.set()
+            ARCHIVE_WAKE.set()
+            log("stopping (the archive worker finishes its current track; signal again to abort)")
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGINT, on_term)
+
+        player.run(stop)
+        server.shutdown()
+        CTL_SOCK.unlink(missing_ok=True)
+        viz.stop()
+        player.shutdown()
+        if mpris:
+            mpris.stop()
+        worker.join(ARCHIVE_STOP_WAIT)
+        if worker.is_alive():  # e.g. an hour-long mix; it stays queued and restarts next time
+            log("archive worker still busy; abandoning the current download")
+
+
+# ---------------------------------------------------------------- playback
+
+STREAM_FORMAT = "hls_aac_160k/bestaudio/best"
+QUEUE_STATUSES = ("archived", "linked", "failed")  # linked/failed stream from SoundCloud
+UNPLAYABLE = ("drm", "gone")                       # SoundCloud-only; mpv can't play them
+OBSERVED = ("pause", "time-pos", "duration", "volume", "paused-for-cache", "idle-active")
+MAX_LOAD_FAILS = 5         # consecutive load errors before giving up
+PREV_RESTARTS_AFTER = 3    # seconds: `prev` restarts the track instead
+PLAY_COUNT_AFTER = 30      # seconds (or half a shorter track) before play_count += 1
+UP_NEXT = 5
+
+# 10-band equalizer: one lavfi `equalizer` per band (octave wide), plus a `volume` pre-amp that
+# pulls the level down by the largest boost so boosted bands don't clip. Gains change live via af-command.
+EQ_BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+EQ_MAX_DB = 12
+EQ_PRESETS = {
+    "flat":       [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "bass":       [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
+    "treble":     [0, 0, 0, 0, 0, 1, 2, 4, 5, 6],
+    "vocal":      [-2, -2, -1, 1, 3, 3, 2, 1, 0, -1],
+    "loudness":   [5, 4, 2, 0, -1, -1, 0, 2, 4, 5],
+    "electronic": [5, 4, 1, 0, -2, 1, 0, 1, 4, 5],
+    "hiphop":     [5, 4, 1, 3, -1, -1, 1, -1, 2, 3],
+}
+
+
+def eq_preamp(gains):
+    return -max(0, max(gains))
+
+
+def eq_af(gains):
+    parts = [f"@eqpre:lavfi=[volume=volume={eq_preamp(gains)}dB]"]
+    parts += [f"@eq{i}:lavfi=[equalizer=f={f}:t=o:w=1:g={g}]" for i, (f, g) in enumerate(zip(EQ_BANDS, gains))]
+    return ",".join(parts)
+
+
+def eq_preset_name(gains):
+    return next((name for name, g in EQ_PRESETS.items() if g == list(gains)), "custom")
+
+
+# Sidebar views of the library. The play queue uses the same filter, restricted to playable tracks.
+VIEWS = {
+    "all": "unliked=0",
+    "local": "status='archived'",
+    "stream": "unliked=0 AND status IN ('linked', 'failed')",
+    "preview": "unliked=0 AND status='preview_only'",
+    "unavailable": "unliked=0 AND status IN ('drm', 'gone')",
+    "failed": "unliked=0 AND status='failed'",
+    "unliked": "unliked=1",
+}
+SORTS = {
+    "liked": "liked_at DESC",
+    "artist": "artist COLLATE NOCASE, liked_at DESC",
+    "title": "title COLLATE NOCASE",
+    "plays": "play_count DESC, liked_at DESC",
+    "duration": "duration DESC",
+    "archived": "archived_at DESC NULLS LAST, liked_at DESC",
+}
+LIST_LIMIT = 500
+
+
+def library_filter(view="all", query=None, artist=None, genre=None, sort="liked", local=False):
+    """-> (where SQL, params, order SQL). `local` is the older CLI spelling of view=local."""
+    if local:
+        view = "local"
+    if view not in VIEWS:
+        raise ValueError(f"unknown view {view!r} (one of {', '.join(VIEWS)})")
+    if sort not in SORTS:
+        raise ValueError(f"unknown sort {sort!r} (one of {', '.join(SORTS)})")
+    where, params = [VIEWS[view]], []
+    if artist:
+        where.append("artist = ? COLLATE NOCASE")
+        params.append(artist)
+    if genre:
+        where.append("genre = ? COLLATE NOCASE")
+        params.append(genre)
+    for word in (query or "").split():
+        where.append("(title LIKE ? OR artist LIKE ? OR genre LIKE ?)")
+        params += [f"%{word}%"] * 3
+    return " AND ".join(f"({w})" for w in where), params, SORTS[sort]
+
+
+class PlayerError(Exception):
+    pass
+
+
+class Unplayable(PlayerError):
+    pass
+
+
+class Mpv:
+    """mpv --idle driven over its JSON IPC socket. Events are pushed onto `events`."""
+
+    def __init__(self, events):
+        self.events = events
+        self.proc = self.sock = None
+        self.send_lock = threading.Lock()
+        self.pending = {}
+        self.next_id = 0
+
+    def start(self, volume, af=None):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MPV_SOCK.unlink(missing_ok=True)
+        self.proc = subprocess.Popen(
+            ["mpv", "--idle=yes", "--no-video", "--no-terminal", "--audio-display=no",
+             "--audio-client-name=sclikes", "--title=sclikes", f"--input-ipc-server={MPV_SOCK}",
+             f"--ytdl-format={STREAM_FORMAT}", f"--volume={volume}",
+             "--load-scripts=no"]  # our own MPRIS server replaces mpv-mpris
+            + ([f"--af={af}"] if af else []),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(200):
+            try:
+                self.sock = socket.socket(socket.AF_UNIX)
+                self.sock.connect(str(MPV_SOCK))
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                self.sock.close()
+                if self.proc.poll() is not None:
+                    raise PlayerError(f"mpv exited with {self.proc.returncode}")
+                time.sleep(0.05)
+        else:
+            raise PlayerError("mpv IPC socket never appeared")
+        threading.Thread(target=self._reader, args=(self.sock,), daemon=True, name="mpv-ipc").start()
+        for i, prop in enumerate(OBSERVED, 1):
+            self.command("observe_property", i, prop)
+
+    def _reader(self, sock):
+        for line in sock.makefile("rb"):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "event" in msg:
+                self.events.put(msg)
+            elif (w := self.pending.pop(msg.get("request_id"), None)):
+                w[1] = msg
+                w[0].set()
+        self.events.put({"event": "mpv-died"})
+
+    def command(self, *args, timeout=15):
+        with self.send_lock:
+            self.next_id += 1
+            rid = self.next_id
+            waiter = self.pending[rid] = [threading.Event(), None]
+            try:
+                self.sock.sendall(json.dumps({"command": list(args), "request_id": rid}).encode() + b"\n")
+            except OSError as e:
+                self.pending.pop(rid, None)
+                raise PlayerError(f"mpv is not responding ({e})")
+        if not waiter[0].wait(timeout):
+            self.pending.pop(rid, None)
+            raise PlayerError(f"mpv timed out on {args[0]}")
+        if waiter[1].get("error") != "success":
+            raise PlayerError(f"mpv {args[0]}: {waiter[1].get('error')}")
+        return waiter[1].get("data")
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.command("quit", timeout=3)
+            except PlayerError:
+                pass
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        MPV_SOCK.unlink(missing_ok=True)
+
+
+def mpv_opt(s):
+    """Escape a value for loadfile's key=value,... options list."""
+    return f"%{len(s.encode())}%{s}"
+
+
+def art_for(row):
+    lp = row["local_path"]
+    if lp and (jpg := Path(lp).with_suffix(".jpg")).is_file():
+        return str(jpg)
+    return (row["artwork"] or "").replace("-large.", "-t500x500.") or None
+
+
+def art_color(src):
+    """The cover art's dominant color as '#rrggbb', '' for grey/mono art, None if unreadable.
+    ffmpeg shrinks the image to 24x24; pixels are binned by hue, weighted by saturation*value, and
+    the heaviest bin's average wins. Vivid pixels first; muted covers get a looser second pass."""
+    import colorsys
+    try:
+        out = subprocess.run(["ffmpeg", "-v", "error", "-i", src, "-vf", "scale=24:24:flags=area",
+                              "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                             capture_output=True, timeout=20).stdout
+    except subprocess.SubprocessError:
+        return None
+    n = len(out) // 3
+    if n < 64:
+        return None
+    px = [colorsys.rgb_to_hsv(out[i] / 255, out[i + 1] / 255, out[i + 2] / 255) + (i,)
+          for i in range(0, n * 3, 3)]
+    # (min saturation, min value, min weight as a share of pixels)
+    for smin, vmin, wmin in ((0.25, 0.2, 0.03), (0.10, 0.12, 0.008)):
+        bins = [[0.0, 0.0, 0.0, 0.0] for _ in range(18)]   # weight, r, g, b
+        for h, sat, v, i in px:
+            if sat < smin or v < vmin:
+                continue
+            w = sat * v
+            bn = bins[int(h * 18) % 18]
+            bn[0] += w; bn[1] += out[i] * w; bn[2] += out[i + 1] * w; bn[3] += out[i + 2] * w
+        w, r, g, b = max(bins, key=lambda x: x[0])
+        if w >= wmin * n:
+            return "#%02x%02x%02x" % tuple(round(c / w) for c in (r, g, b))
+    return ""  # essentially greyscale
+
+
+def track_info(row):
+    local = row["status"] == "archived" and row["local_path"] and Path(row["local_path"]).is_file()
+    return {"sc_id": row["sc_id"], "artist": row["artist"], "title": row["title"],
+            "duration": (row["duration"] or 0) / 1000, "art": art_for(row),
+            "permalink": row["permalink"], "purchase_url": row["purchase_url"],
+            "status": row["status"], "source": "local" if local else "stream",
+            "path": row["local_path"] if local else None,
+            "play_count": row["play_count"], "genre": row["genre"],
+            "color": row["art_color"] or None if "art_color" in row.keys() else None}
+
+
+class Player:
+    """Owns the queue; mpv only ever holds the current track. All public methods take self.lock."""
+
+    def __init__(self):
+        self.con = db_connect(threaded=True)
+        self.lock = threading.RLock()
+        self.events = queue.Queue()
+        self.mpv = Mpv(self.events)
+        self.props = {}
+        self.base, self.queue, self.idx = [], [], -1   # base = liked order under the current filter
+        self.shuffle, self.repeat, self.filter, self.volume = False, "all", {}, 100
+        self.eq = list(EQ_PRESETS["flat"])
+        self.cur = None          # track_info of queue[idx]
+        self.entry_id = None     # mpv playlist entry of the loaded file; None = stopped
+        self.start_pos = 0       # resume position for the next load
+        self.counted = False
+        self.fails = 0
+        self.error = None
+        self.dirty = True
+        self.stopping = threading.Event()
+        self.on_publish = []     # callbacks(snapshot): Mpris, Visualizer
+        self._restore()
+
+    # -- persistence (kv 'player'), so a daemon restart resumes where it was
+
+    def _restore(self):
+        try:
+            s = json.loads(kv_get(self.con, "player") or "{}")
+        except ValueError:
+            s = {}
+        self.base, self.queue = s.get("base", []), s.get("queue", [])
+        self.idx = s.get("idx", -1) if self.queue else -1
+        self.shuffle, self.repeat = s.get("shuffle", False), s.get("repeat", "all")
+        self.filter, self.volume = s.get("filter", {}), 100  # loudness lives in the system volume
+        eq = s.get("eq")
+        if isinstance(eq, list) and len(eq) == len(EQ_BANDS):
+            self.eq = [max(-EQ_MAX_DB, min(EQ_MAX_DB, float(g))) for g in eq]
+        self.start_pos = s.get("pos", 0)
+        if 0 <= self.idx < len(self.queue):
+            self.cur = self._info(self.queue[self.idx])
+            if self.cur:
+                self._want_color(self.cur)
+
+    def _save(self):
+        pos = self.props.get("time-pos") if self.entry_id else self.start_pos
+        kv_set(self.con, "player", json.dumps({
+            "base": self.base, "queue": self.queue, "idx": self.idx, "shuffle": self.shuffle,
+            "repeat": self.repeat, "filter": self.filter, "volume": self.volume, "eq": self.eq,
+            "pos": pos or 0}))
+        self.con.commit()
+
+    def _want_color(self, info):
+        """Fill info['color'] from the cover art in the background (cached in tracks.art_color)."""
+        sid = info["sc_id"]
+        if self.con.execute("SELECT art_color FROM tracks WHERE sc_id=?", (sid,)).fetchone()[0] is not None:
+            return
+        src = info.get("art")
+        if not src:
+            return
+
+        def work():
+            c = art_color(src)
+            if c is None:
+                return  # unreadable (offline?); retried next time the track loads
+            with self.lock:
+                self.con.execute("UPDATE tracks SET art_color=? WHERE sc_id=?", (c, sid))
+                self.con.commit()
+                if self.cur and self.cur["sc_id"] == sid:
+                    self.cur["color"] = c or None
+                    self.dirty = True
+        threading.Thread(target=work, daemon=True, name="art-color").start()
+
+    def _info(self, sc_id):
+        row = self.con.execute("SELECT * FROM tracks WHERE sc_id=?", (sc_id,)).fetchone()
+        return track_info(row) if row else None
+
+    # -- lifecycle
+
+    def start(self):
+        self.mpv.start(self.volume, eq_af(self.eq))
+
+    def shutdown(self):
+        with self.lock:
+            self._save()
+            if self.entry_id:
+                self.start_pos = self.props.get("time-pos") or 0
+            self.entry_id = None
+            self.mpv.stop()
+            self._publish()
+
+    def run(self, stop):
+        """Main loop: handle mpv events, count plays, publish state.json about once a second."""
+        self.stopping = stop
+        last_pub = last_save = 0
+        while not stop.is_set():
+            try:
+                ev = self.events.get(timeout=0.5)
+            except queue.Empty:
+                ev = None
+            with self.lock:
+                if ev:
+                    try:
+                        self._on_event(ev)
+                    except PlayerError as e:
+                        self.error = str(e)
+                        log(f"player: {e}")
+                self._maybe_count()
+                now = time.monotonic()
+                playing = self.entry_id and not self.props.get("pause")
+                if self.dirty or (playing and now - last_pub >= 1):
+                    self._publish()
+                    last_pub = now
+                if playing and now - last_save >= 15:
+                    self._save()
+                    last_save = now
+
+    def _on_event(self, ev):
+        name = ev["event"]
+        if name == "property-change":
+            self.props[ev["name"]] = ev.get("data")
+            if ev["name"] == "volume" and ev.get("data") is not None:
+                self.volume = round(ev["data"])
+            if ev["name"] != "time-pos":
+                self.dirty = True
+        elif name == "end-file" and ev.get("playlist_entry_id") == self.entry_id:
+            reason = ev.get("reason")
+            if reason == "eof":
+                if not self.counted:
+                    self._count()
+                self.fails = 0
+                self._advance(auto=True)
+            elif reason == "error":
+                self.fails += 1
+                self.error = f"{self.cur['artist']} - {self.cur['title']}: {ev.get('file_error', 'failed to load')}"
+                log(f"player: {self.error}")
+                if self.fails >= MAX_LOAD_FAILS:
+                    self.entry_id = None
+                    self.error = f"{self.fails} tracks in a row failed to play; stopped"
+                else:
+                    self._advance(auto=True, keep_error=True)
+            self.dirty = True
+        elif name == "mpv-died" and not self.stopping.is_set():
+            log("player: mpv exited; restarting it")
+            self.entry_id = None
+            self.props = {}
+            self.mpv.stop()
+            time.sleep(1)
+            self.mpv.start(self.volume, eq_af(self.eq))
+            self.dirty = True
+
+    def _maybe_count(self):
+        pos, dur = self.props.get("time-pos"), self.props.get("duration")
+        if self.entry_id and not self.counted and pos and pos >= min(PLAY_COUNT_AFTER, (dur or 60) / 2):
+            self._count()
+
+    def _count(self):
+        self.counted = True
+        self.con.execute("UPDATE tracks SET play_count=play_count+1 WHERE sc_id=?", (self.cur["sc_id"],))
+        self.con.commit()
+
+    # -- queue
+
+    def _build(self, **flt):
+        where, params, order = library_filter(**flt)
+        return [r[0] for r in self.con.execute(
+            f"SELECT sc_id FROM tracks WHERE {where} AND status IN {QUEUE_STATUSES} ORDER BY {order}", params)]
+
+    def _order(self, first=None):
+        """Set self.queue from self.base (shuffled or not), with `first` as the current track."""
+        if self.shuffle:
+            rest = [i for i in self.base if i != first]
+            random.shuffle(rest)
+            self.queue = ([first] if first is not None else []) + rest
+            self.idx = 0
+        else:
+            self.queue = list(self.base)
+            self.idx = self.queue.index(first) if first in self.queue else 0
+
+    def _load(self, idx, pos=0):
+        info = self._info(self.queue[idx])
+        if not info:
+            raise Unplayable(f"track {self.queue[idx]} is not in the library")
+        if info["status"] in UNPLAYABLE:
+            raise Unplayable(f"SoundCloud-only ({info['status']}): {info['permalink']}")
+        self.idx, self.cur, self.counted, self.dirty = idx, info, False, True
+        self._want_color(info)
+        target = (self.con.execute("SELECT local_path FROM tracks WHERE sc_id=?", (info["sc_id"],)).fetchone()[0]
+                  if info["source"] == "local" else info["permalink"])
+        opts = f"force-media-title={mpv_opt(f'{info['artist']} - {info['title']}')}"
+        if pos:
+            opts += f",start={pos:.1f}"
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.command("af", "set", eq_af(self.eq))  # live af-commands don't survive a new file
+        res = self.mpv.command("loadfile", target, "replace", -1, opts)
+        self.entry_id = (res or {}).get("playlist_entry_id")
+        self.props["time-pos"], self.props["duration"] = None, None  # "loading" until mpv reports the new file
+        self.start_pos = 0
+        self._save()
+
+    def _advance(self, auto=False, step=1, keep_error=False):
+        if not keep_error:
+            self.error = None
+        if not self.queue:
+            raise PlayerError("the queue is empty; try `sclikes play`")
+        if auto and self.repeat == "one" and step == 1 and self.fails == 0:
+            return self._load(self.idx)
+        nxt = self.idx + step
+        for _ in range(len(self.queue)):
+            if not 0 <= nxt < len(self.queue):
+                if self.repeat == "off" and auto:
+                    self.mpv.command("stop")
+                    self.entry_id = None
+                    self.dirty = True
+                    return
+                if self.repeat == "off" and step < 0:
+                    nxt = 0
+                elif self.shuffle and step > 0:
+                    self._order()      # new shuffle for the next lap
+                    nxt = 0
+                else:
+                    nxt %= len(self.queue)
+            try:
+                return self._load(nxt)
+            except Unplayable as e:    # e.g. the archiver found DRM since the queue was built
+                log(f"player: skipping {e}")
+                nxt += 1 if step > 0 else -1
+        raise PlayerError("nothing in the queue is playable")
+
+    # -- commands (called from control-socket threads)
+
+    def dispatch(self, cmd, args):
+        fn = getattr(self, f"cmd_{cmd}", None)
+        if not fn:
+            raise PlayerError(f"unknown command {cmd!r}")
+        with self.lock:
+            if cmd in LIBRARY_CMDS:
+                return fn(**args)
+            fn(**args)
+            if self.entry_id:  # property events lag the command; read back what the reply shows
+                for prop in ("pause", "time-pos"):
+                    try:
+                        self.props[prop] = self.mpv.command("get_property", prop, timeout=2)
+                    except PlayerError:
+                        pass
+            self._publish()
+            return self.snapshot()
+
+    def cmd_play(self, sc_id=None, shuffle=None, **flt):
+        """No args: resume. sc_id alone: jump within the queue (or play it). Filter keys (view, query,
+        artist, genre, sort, local): new queue from that library view, starting at sc_id if given."""
+        self.error = None
+        if shuffle is not None:
+            self.cmd_shuffle("on" if shuffle else "off")
+        flt = {k: v for k, v in flt.items() if v not in (None, "", False)}
+        if sc_id is None and not flt:
+            if self.entry_id:                  # resume
+                return self.mpv.command("set_property", "pause", False)
+            if not self.queue:                 # first run: everything, liked order
+                self.base, self.filter = self._build(), {}
+                self._order()
+                if not self.queue:
+                    raise PlayerError("nothing playable in the library yet")
+            try:
+                return self._load(max(self.idx, 0), pos=self.start_pos)
+            except Unplayable:
+                return self._advance()
+        if sc_id in self.queue and not flt:  # jump within the current queue
+            return self._load(self.queue.index(sc_id))
+        if flt or not self.base:
+            if flt.pop("local", None):
+                flt["view"] = "local"
+            self.base = self._build(**flt)
+            self.filter = flt
+        if sc_id is not None:
+            info = self._info(sc_id)
+            if not info:
+                raise PlayerError(f"unknown track {sc_id}")
+            if info["status"] in UNPLAYABLE:
+                raise Unplayable(f"SoundCloud-only ({info['status']}): {info['permalink']}")
+            if sc_id not in self.base:
+                self.base.insert(0, sc_id)
+            self._order(first=sc_id)
+        else:
+            if not self.base:
+                raise PlayerError("no tracks match")
+            self._order(first=random.choice(self.base) if self.shuffle else self.base[0])
+        try:
+            self._load(self.idx)
+        except Unplayable:
+            self._advance()
+
+    def cmd_pause(self, on=None):
+        if not self.entry_id:
+            if on:
+                return
+            return self.cmd_play()
+        self.mpv.command("set_property", "pause", (not self.props.get("pause")) if on is None else on)
+
+    def cmd_stop(self):
+        if self.entry_id:
+            self.start_pos = 0
+            self.entry_id = None
+            self.mpv.command("stop")
+            self._save()
+        self.dirty = True
+
+    def cmd_next(self):
+        self._advance()
+
+    def cmd_prev(self):
+        if self.entry_id and (self.props.get("time-pos") or 0) > PREV_RESTARTS_AFTER:
+            return self.mpv.command("seek", 0, "absolute")
+        self._advance(step=-1)
+
+    def cmd_seek(self, to):
+        if not self.entry_id:
+            raise PlayerError("nothing is playing")
+        s = str(to).strip()
+        if s.endswith("%"):
+            return self.mpv.command("seek", float(s[:-1]), "absolute-percent")
+        mode = "relative" if s[0] in "+-" else "absolute"
+        secs = 0.0
+        for part in s.lstrip("+-").split(":"):
+            secs = secs * 60 + float(part)
+        self.mpv.command("seek", -secs if s[0] == "-" else secs, mode)
+
+    def cmd_vol(self, to):
+        """Volume is the system output's (the same knob as the fn keys); mpv stays at 100."""
+        s = str(to).strip()
+        if s[0] in "+-":
+            subprocess.run(["omarchy-audio-output-volume", f"{s[0]}{round(abs(float(s)))}"],
+                           capture_output=True, timeout=5)
+        else:
+            sink = subprocess.run(["omarchy-audio-output-sink"], capture_output=True, text=True,
+                                  timeout=5).stdout.strip() or "@DEFAULT_SINK@"
+            subprocess.run(["pactl", "set-sink-volume", sink, f"{max(0, min(100, round(float(s))))}%"],
+                           capture_output=True, timeout=5)
+        if self.volume != 100:
+            self.volume = 100
+            self.mpv.command("set_property", "volume", 100)
+            self._save()
+
+    def cmd_shuffle(self, mode="toggle"):
+        on = (not self.shuffle) if mode == "toggle" else mode == "on"
+        if on != self.shuffle:
+            self.shuffle = on
+            cur = self.queue[self.idx] if 0 <= self.idx < len(self.queue) else None
+            self._order(first=cur)
+            self._save()
+
+    def cmd_repeat(self, mode=None):
+        modes = ["off", "all", "one"]
+        self.repeat = mode or modes[(modes.index(self.repeat) + 1) % 3]
+        self._save()
+
+    def cmd_status(self):
+        pass
+
+    def cmd_eq(self, preset=None, gains=None, band=None, gain=None):
+        """preset name | gains [10 dB values] | band index + gain dB. Applied live, saved."""
+        new = list(self.eq)
+        if preset is not None:
+            if preset not in EQ_PRESETS:
+                raise PlayerError(f"unknown preset {preset!r} (one of {', '.join(EQ_PRESETS)})")
+            new = list(EQ_PRESETS[preset])
+        if gains is not None:
+            if len(gains) != len(EQ_BANDS):
+                raise PlayerError(f"need {len(EQ_BANDS)} gains")
+            new = [float(g) for g in gains]
+        if band is not None:
+            new[int(band)] = float(gain or 0)
+        new = [round(max(-EQ_MAX_DB, min(EQ_MAX_DB, g)), 1) for g in new]
+        try:  # glitch-free live update of the running filter chain
+            for i, (old, g) in enumerate(zip(self.eq, new)):
+                if old != g:
+                    self.mpv.command("af-command", f"eq{i}", "gain", str(g), "equalizer")
+            if eq_preamp(new) != eq_preamp(self.eq):
+                self.mpv.command("af-command", "eqpre", "volume", f"{eq_preamp(new)}dB", "volume")
+        except PlayerError:  # no audio chain yet (stopped, or a stream still loading): set the option
+            self.mpv.command("af", "set", eq_af(new))
+        self.eq = new
+        self._save()
+
+    # -- library (read-only queries + archive requests; replies are not player snapshots)
+
+    def cmd_list(self, offset=0, limit=200, **flt):
+        where, params, order = library_filter(**flt)
+        limit = max(1, min(int(limit), LIST_LIMIT))
+        total = self.con.execute(f"SELECT COUNT(*) FROM tracks WHERE {where}", params).fetchone()[0]
+        prio = set(archive_priority(self.con))
+        rows = []
+        for r in self.con.execute(
+                f"""SELECT sc_id, title, artist, duration, status, unliked, play_count, genre, liked_at,
+                           local_path, permalink FROM tracks WHERE {where} ORDER BY {order}
+                    LIMIT ? OFFSET ?""", params + [limit, int(offset)]):
+            rows.append({"sc_id": r["sc_id"], "title": r["title"], "artist": r["artist"],
+                         "duration": (r["duration"] or 0) / 1000, "status": r["status"],
+                         "unliked": bool(r["unliked"]), "plays": r["play_count"], "genre": r["genre"],
+                         "liked_at": r["liked_at"], "permalink": r["permalink"],
+                         "archiving": r["sc_id"] in prio})
+        return {"rows": rows, "total": total, "offset": int(offset)}
+
+    def cmd_facets(self, top_artists=150, top_genres=40):
+        views = {v: self.con.execute(f"SELECT COUNT(*) FROM tracks WHERE {cond}").fetchone()[0]
+                 for v, cond in VIEWS.items()}
+        artists = [{"name": r[0], "n": r[1]} for r in self.con.execute(
+            "SELECT artist, COUNT(*) n FROM tracks WHERE unliked=0 AND artist IS NOT NULL "
+            "GROUP BY artist COLLATE NOCASE ORDER BY n DESC, artist COLLATE NOCASE LIMIT ?", (int(top_artists),))]
+        genres = [{"name": r[0], "n": r[1]} for r in self.con.execute(
+            "SELECT genre, COUNT(*) n FROM tracks WHERE unliked=0 AND genre IS NOT NULL AND genre != '' "
+            "GROUP BY genre COLLATE NOCASE ORDER BY n DESC LIMIT ?", (int(top_genres),))]
+        return {"views": views, "artists": artists, "genres": genres}
+
+    def cmd_archive_now(self, sc_id):
+        row = self.con.execute("SELECT status, artist, title FROM tracks WHERE sc_id=?", (sc_id,)).fetchone()
+        if not row:
+            raise PlayerError(f"unknown track {sc_id}")
+        if row["status"] == "archived":
+            return {"sc_id": sc_id, "status": "archived", "position": 0}
+        if row["status"] not in ("linked", "failed"):
+            raise PlayerError(f"can't archive a {row['status']} track (SoundCloud-only)")
+        self.con.execute("UPDATE tracks SET status='linked', attempts=0, error=NULL WHERE sc_id=?", (sc_id,))
+        prio = [i for i in archive_priority(self.con) if i != sc_id] + [sc_id]
+        kv_set(self.con, "archive_priority", json.dumps(prio))
+        self.con.commit()
+        ARCHIVE_WAKE.set()
+        log(f"archive now: {row['artist']} - {row['title']} (position {len(prio)})")
+        return {"sc_id": sc_id, "status": "queued", "position": len(prio)}
+
+    # -- state
+
+    def snapshot(self):
+        p = self.props
+        if not self.entry_id:
+            state = "stopped"
+        elif p.get("pause"):
+            state = "paused"
+        elif p.get("paused-for-cache") or p.get("time-pos") is None:
+            state = "loading"
+        else:
+            state = "playing"
+        up = []
+        for i in range(self.idx + 1, len(self.queue)):
+            if len(up) >= UP_NEXT:
+                break
+            if (t := self._info(self.queue[i])):
+                up.append({k: t[k] for k in ("sc_id", "artist", "title", "duration", "source")})
+        return {
+            "state": state, "track": self.cur,
+            "pos": round((p.get("time-pos") if self.entry_id else self.start_pos) or 0, 2),
+            "duration": p.get("duration") or (self.cur or {}).get("duration"),
+            "pos_at": time.time(), "volume": self.volume, "shuffle": self.shuffle,
+            "repeat": self.repeat, "filter": self.filter, "index": self.idx,
+            "queue_len": len(self.queue), "up_next": up, "error": self.error, "pid": os.getpid(),
+            "eq": {"gains": self.eq, "preset": eq_preset_name(self.eq), "bands": EQ_BANDS,
+                   "presets": list(EQ_PRESETS), "max_db": EQ_MAX_DB},
+        }
+
+    def _publish(self):
+        self.dirty = False
+        snap = self.snapshot()
+        write_state("player", snap)
+        for fn in self.on_publish:
+            fn(snap)
+
+
+# ---------------------------------------------------------------- MPRIS
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.sclikes"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+MPRIS_XML = """<node>
+ <interface name="org.mpris.MediaPlayer2">
+  <method name="Raise"/><method name="Quit"/>
+  <property name="CanQuit" type="b" access="read"/>
+  <property name="CanRaise" type="b" access="read"/>
+  <property name="HasTrackList" type="b" access="read"/>
+  <property name="Identity" type="s" access="read"/>
+  <property name="SupportedUriSchemes" type="as" access="read"/>
+  <property name="SupportedMimeTypes" type="as" access="read"/>
+ </interface>
+ <interface name="org.mpris.MediaPlayer2.Player">
+  <method name="Next"/><method name="Previous"/><method name="Pause"/><method name="PlayPause"/>
+  <method name="Stop"/><method name="Play"/>
+  <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+  <method name="SetPosition"><arg direction="in" name="TrackId" type="o"/><arg direction="in" name="Position" type="x"/></method>
+  <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+  <signal name="Seeked"><arg name="Position" type="x"/></signal>
+  <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="LoopStatus" type="s" access="readwrite"/>
+  <property name="Rate" type="d" access="readwrite"/>
+  <property name="Shuffle" type="b" access="readwrite"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
+  <property name="Volume" type="d" access="readwrite"/>
+  <property name="Position" type="x" access="read"/>
+  <property name="MinimumRate" type="d" access="read"/>
+  <property name="MaximumRate" type="d" access="read"/>
+  <property name="CanGoNext" type="b" access="read"/>
+  <property name="CanGoPrevious" type="b" access="read"/>
+  <property name="CanPlay" type="b" access="read"/>
+  <property name="CanPause" type="b" access="read"/>
+  <property name="CanSeek" type="b" access="read"/>
+  <property name="CanControl" type="b" access="read"/>
+ </interface>
+</node>"""
+LOOP_TO_MPRIS = {"off": "None", "one": "Track", "all": "Playlist"}
+LOOP_FROM_MPRIS = {v: k for k, v in LOOP_TO_MPRIS.items()}
+NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+
+class Mpris:
+    """MPRIS2 server for the Player (media keys, OSD, omarchy.media). Runs a GLib loop in its own
+    thread; D-Bus calls go through Player.dispatch, and state comes from Player._publish snapshots."""
+
+    def __init__(self, player, name=MPRIS_NAME):
+        from gi.repository import Gio, GLib  # optional dependency (python-gobject)
+        self.Gio, self.GLib = Gio, GLib
+        self.player, self.name = player, name
+        self.props = {}              # interface -> {property: python value}
+        self.seek_ref = None         # (sc_id, pos, monotonic time, playing) for Seeked detection
+        self.loop = self.conn = self.owner = None
+        self.ready = threading.Event()
+
+    def start(self):
+        # Fill properties before the name goes live, so a client's first GetAll is complete.
+        self.props, _ = self._compute(self.player.snapshot())
+        threading.Thread(target=self._run, daemon=True, name="mpris").start()
+        self.ready.wait(5)
+        self.player.on_publish.append(self.update)
+
+    def stop(self):
+        if self.loop:
+            self.GLib.idle_add(self.loop.quit)
+
+    def _run(self):
+        Gio, GLib = self.Gio, self.GLib
+        try:
+            node = Gio.DBusNodeInfo.new_for_xml(MPRIS_XML)
+            self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            register = getattr(self.conn, "register_object_with_closures2", None) or self.conn.register_object
+            for iface in node.interfaces:
+                register(MPRIS_PATH, iface, self._on_call, self._on_get, self._on_set)
+            self.owner = Gio.bus_own_name_on_connection(self.conn, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
+            self.loop = GLib.MainLoop()
+        except Exception as e:
+            log(f"mpris: disabled ({e})")
+            return
+        finally:
+            self.ready.set()
+        self.loop.run()
+        Gio.bus_unown_name(self.owner)
+
+    # -- state
+
+    def update(self, snap):
+        """Called from Player._publish (any thread). Diff and emit PropertiesChanged on the GLib thread."""
+        props, seeked = self._compute(snap)
+        self.GLib.idle_add(self._emit, props, seeked)
+
+    def _compute(self, snap):
+        t = snap.get("track")
+        state = snap["state"]
+        has_queue = snap.get("queue_len", 0) > 0
+        md = {"mpris:trackid": ("o", NO_TRACK)}
+        if t:
+            md = {"mpris:trackid": ("o", f"/sclikes/track/{t['sc_id']}"),
+                  "mpris:length": ("x", int((snap.get("duration") or t.get("duration") or 0) * 1e6)),
+                  "xesam:title": ("s", t.get("title") or ""),
+                  "xesam:artist": ("as", [t.get("artist") or ""]),
+                  "xesam:url": ("s", t.get("permalink") or ""),
+                  "xesam:useCount": ("i", int(t.get("play_count") or 0))}
+            if t.get("genre"):
+                md["xesam:genre"] = ("as", [t["genre"]])
+            art = t.get("art")
+            if art:
+                md["mpris:artUrl"] = ("s", "file://" + urllib.parse.quote(art) if art.startswith("/") else art)
+        props = {
+            "org.mpris.MediaPlayer2": {
+                "CanQuit": False, "CanRaise": True, "HasTrackList": False, "Identity": "SoundCloud Likes",
+                "SupportedUriSchemes": [], "SupportedMimeTypes": []},
+            MPRIS_PLAYER: {
+                "PlaybackStatus": {"playing": "Playing", "loading": "Playing", "paused": "Paused"}.get(state, "Stopped"),
+                "LoopStatus": LOOP_TO_MPRIS.get(snap.get("repeat"), "Playlist"),
+                "Rate": 1.0, "MinimumRate": 1.0, "MaximumRate": 1.0,
+                "Shuffle": bool(snap.get("shuffle")),
+                "Metadata": md,
+                "Volume": (snap.get("volume") or 0) / 100,
+                "CanGoNext": has_queue, "CanGoPrevious": has_queue, "CanPlay": has_queue or bool(t),
+                "CanPause": bool(t), "CanSeek": state != "stopped", "CanControl": True}}
+        return props, self._seeked(snap, t)
+
+    def _seeked(self, snap, t):
+        """Position that jumped more than 2 s from where playback should be, else None."""
+        now = time.monotonic()
+        pos, sid, playing = snap.get("pos") or 0, t and t["sc_id"], snap["state"] == "playing"
+        ref, self.seek_ref = self.seek_ref, (sid, pos, now, playing)
+        if not ref or ref[0] != sid or snap["state"] == "stopped":
+            return None
+        expected = ref[1] + (now - ref[2] if ref[3] else 0)
+        return pos if abs(pos - expected) > 2 else None
+
+    def _emit(self, props, seeked):
+        GLib = self.GLib
+        for iface, values in props.items():
+            old = self.props.get(iface, {})
+            changed = {k: v for k, v in values.items() if old.get(k) != v}
+            self.props[iface] = values
+            if changed and old and self.conn:
+                self.conn.emit_signal(None, MPRIS_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                      GLib.Variant("(sa{sv}as)", (iface, {k: self._variant(iface, k, v)
+                                                                            for k, v in changed.items()}, [])))
+        if seeked is not None and self.conn:
+            self.conn.emit_signal(None, MPRIS_PATH, MPRIS_PLAYER, "Seeked", GLib.Variant("(x)", (int(seeked * 1e6),)))
+        return False
+
+    SIGS = {"b": ("CanQuit", "CanRaise", "HasTrackList", "Shuffle", "CanGoNext", "CanGoPrevious",
+                  "CanPlay", "CanPause", "CanSeek", "CanControl"),
+            "d": ("Rate", "MinimumRate", "MaximumRate", "Volume"),
+            "as": ("SupportedUriSchemes", "SupportedMimeTypes")}
+
+    def _variant(self, iface, name, value):
+        V = self.GLib.Variant
+        if name == "Metadata":
+            return V("a{sv}", {k: V(sig, v) for k, (sig, v) in value.items()})
+        for sig, names in self.SIGS.items():
+            if name in names:
+                return V(sig, value)
+        return V("s", value)
+
+    # -- D-Bus handlers (GLib thread)
+
+    def _on_get(self, conn, sender, path, iface, name):
+        if name == "Position":
+            pos = self.player.props.get("time-pos") if self.player.entry_id else 0
+            return self.GLib.Variant("x", int((pos or 0) * 1e6))
+        if name not in self.props.get(iface, {}):
+            return None
+        return self._variant(iface, name, self.props[iface][name])
+
+    def _on_set(self, conn, sender, path, iface, name, value):
+        v = value.unpack()
+        try:
+            if name == "LoopStatus" and v in LOOP_FROM_MPRIS:
+                self.player.dispatch("repeat", {"mode": LOOP_FROM_MPRIS[v]})
+            elif name == "Shuffle":
+                self.player.dispatch("shuffle", {"mode": "on" if v else "off"})
+            elif name == "Volume":
+                self.player.dispatch("vol", {"to": str(round(max(0.0, min(1.0, v)) * 100))})
+            return True
+        except (PlayerError, ValueError) as e:
+            log(f"mpris: set {name}: {e}")
+            return False
+
+    def _on_call(self, conn, sender, path, iface, method, params, invocation):
+        args = params.unpack()
+        calls = {"Next": ("next", {}), "Previous": ("prev", {}), "PlayPause": ("pause", {}),
+                 "Pause": ("pause", {"on": True}), "Play": ("pause", {"on": False}), "Stop": ("stop", {})}
+        try:
+            if method in calls:
+                self.player.dispatch(*calls[method])
+            elif method == "Seek":
+                self.player.dispatch("seek", {"to": f"{args[0] / 1e6:+.3f}"})
+            elif method == "SetPosition":
+                cur = self.props.get(MPRIS_PLAYER, {}).get("Metadata", {}).get("mpris:trackid", ("o", ""))[1]
+                if args[0] == cur and args[1] >= 0:
+                    self.player.dispatch("seek", {"to": f"{args[1] / 1e6:.3f}"})
+            elif method == "Raise":
+                subprocess.Popen(["omarchy-shell", PLUGIN_ID, "expand"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif method == "OpenUri":
+                return invocation.return_dbus_error("org.mpris.MediaPlayer2.sclikes.NotSupported",
+                                                    "OpenUri is not supported")
+            invocation.return_value(None)
+        except (PlayerError, ValueError, OSError) as e:
+            invocation.return_dbus_error("org.mpris.MediaPlayer2.sclikes.Error", str(e))
+
+
+# ---------------------------------------------------------------- visualizer
+
+CAVA_BARS = 32
+CAVA_CONF = f"""[general]
+framerate = 30
+bars = {CAVA_BARS}
+autosens = 1
+[input]
+method = pipewire
+source = auto
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 100
+bar_delimiter = 59
+frame_delimiter = 10
+channels = mono
+mono_option = average
+[smoothing]
+noise_reduction = 70
+"""
+
+
+class Visualizer:
+    """Runs cava (spectrum of the default output) only while we're playing and a client is
+    subscribed, and pushes {"viz": [0..100 x CAVA_BARS]} lines to the subscribed ctl connections."""
+
+    def __init__(self):
+        self.subs = set()
+        self.lock = threading.Lock()
+        self.proc = None
+        self.playing = False
+        self.available = shutil.which("cava") is not None
+
+    def update(self, snap):  # Player publish hook
+        playing = snap["state"] == "playing"
+        if playing != self.playing:
+            self.playing = playing
+            self._sync()
+
+    def subscribe(self, client):
+        with self.lock:
+            self.subs.add(client)
+        self._sync()
+        return {"available": self.available, "bars": CAVA_BARS}
+
+    def unsubscribe(self, client):
+        with self.lock:
+            self.subs.discard(client)
+        self._sync()
+
+    def stop(self):
+        self.playing = False
+        self._sync()
+
+    def _sync(self):
+        with self.lock:
+            if not self.available:
+                self.available = shutil.which("cava") is not None  # installed while we run
+            want = self.available and self.playing and bool(self.subs)
+            running = self.proc is not None and self.proc.poll() is None
+            if want and not running:
+                conf = STATE_DIR / "cava.conf"
+                conf.write_text(CAVA_CONF)
+                self.proc = subprocess.Popen(["cava", "-p", str(conf)], stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                threading.Thread(target=self._reader, args=(self.proc,), daemon=True, name="cava").start()
+            elif not want and running:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                self.proc = None
+        if not want:
+            self._broadcast([0] * CAVA_BARS)  # let the bars fall
+
+    def _reader(self, proc):
+        for line in proc.stdout:
+            try:
+                bars = [int(v) for v in line.decode().strip().rstrip(";").split(";")]
+            except ValueError:
+                continue
+            self._broadcast(bars)
+
+    def _broadcast(self, bars):
+        data = json.dumps({"viz": bars}).encode() + b"\n"
+        with self.lock:
+            subs = list(self.subs)
+        for client in subs:
+            client.send_frame(data)
+
+
+LIBRARY_CMDS = {"list", "facets", "archive_now"}
+
+
+class ControlServer(socketserver.ThreadingUnixStreamServer):
+    """JSON lines on ctl.sock: {"cmd": "next", "args": {...}} -> {"ok": true, "data": snapshot}."""
+    daemon_threads = True
+
+    def __init__(self, player):
+        self.player = player
+        CTL_SOCK.unlink(missing_ok=True)
+        old = os.umask(0o077)
+        try:
+            super().__init__(str(CTL_SOCK), ControlHandler)
+        finally:
+            os.umask(old)
+
+
+class ControlHandler(socketserver.StreamRequestHandler):
+    def setup(self):
+        super().setup()
+        self.wlock = threading.Lock()   # replies and pushed viz frames share the socket
+
+    def send_line(self, data):
+        with self.wlock:
+            self.connection.sendall(data)
+
+    def send_frame(self, data):
+        """Best effort: drop the frame rather than block when the client isn't reading."""
+        with self.wlock:
+            try:
+                sent = self.connection.send(data, socket.MSG_DONTWAIT)
+                if sent < len(data):
+                    self.connection.sendall(data[sent:])  # keep line framing intact
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                viz = getattr(self.server, "viz", None)
+                if viz:
+                    threading.Thread(target=viz.unsubscribe, args=(self,), daemon=True).start()
+
+    def finish(self):
+        viz = getattr(self.server, "viz", None)
+        if viz:
+            viz.unsubscribe(self)
+        super().finish()
+
+    def handle(self):
+        for line in self.rfile:
+            req = {}
+            try:
+                req = json.loads(line)
+                viz = getattr(self.server, "viz", None)
+                if req["cmd"] in ("viz_subscribe", "viz_unsubscribe"):
+                    if not viz:
+                        raise PlayerError("visualizer not running")
+                    data = viz.subscribe(self) if req["cmd"] == "viz_subscribe" else viz.unsubscribe(self)
+                    resp = {"ok": True, "data": data}
+                else:
+                    resp = {"ok": True, "data": self.server.player.dispatch(req["cmd"], req.get("args") or {})}
+            except (PlayerError, ValueError, TypeError, KeyError) as e:
+                resp = {"ok": False, "error": str(e) or type(e).__name__}
+            except Exception as e:
+                log("control: " + traceback.format_exc())
+                resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            if isinstance(req, dict) and "id" in req:  # lets clients match replies to requests
+                resp["id"] = req["id"]
+            resp["cmd"] = req.get("cmd") if isinstance(req, dict) else None
+            try:
+                self.send_line(json.dumps(resp, ensure_ascii=False).encode() + b"\n")
+            except OSError:
+                return
+
+
+def ctl(cmd, **args):
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(str(CTL_SOCK))
+    except (FileNotFoundError, ConnectionRefusedError):
+        sys.exit("the sclikes daemon isn't running (systemctl --user start sclikes)")
+    s.settimeout(30)
+    s.sendall(json.dumps({"cmd": cmd, "args": args}).encode() + b"\n")
+    line = s.makefile("rb").readline()
+    s.close()
+    if not line:
+        sys.exit("no reply from the daemon")
+    resp = json.loads(line)
+    if not resp["ok"]:
+        sys.exit(resp["error"])
+    return resp["data"]
+
+
+def fmt_time(secs):
+    secs = int(secs or 0)
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+def print_now(snap):
+    t = snap["track"]
+    icon = {"playing": "▶", "paused": "⏸", "loading": "…", "stopped": "■"}[snap["state"]]
+    if not t:
+        print(f"{icon} (nothing queued)")
+    else:
+        print(f"{icon} {t['artist']} - {t['title']}  {fmt_time(snap['pos'])}/{fmt_time(snap['duration'])}"
+              f"  [{t['source']}]  vol {snap['volume']}"
+              f"{'  shuffle' if snap['shuffle'] else ''}  repeat {snap['repeat']}"
+              f"  #{snap['index'] + 1}/{snap['queue_len']}")
+    if snap.get("error"):
+        print(f"! {snap['error']}")
+
+
+def cmd_player(args):
+    c = args.cmd
+    if c == "play":
+        kw = {k: v for k, v in (("sc_id", args.id), ("query", args.query), ("artist", args.artist),
+                                ("genre", args.genre), ("view", args.view), ("sort", args.sort),
+                                ("local", args.local or None), ("shuffle", args.shuffle)) if v is not None}
+        snap = ctl("play", **kw)
+    elif c == "pause":
+        snap = ctl("pause", **({"on": args.on} if args.on is not None else {}))
+    elif c in ("stop", "next", "prev"):
+        snap = ctl(c)
+    elif c == "seek":
+        snap = ctl("seek", to=args.to)
+    elif c == "vol":
+        snap = ctl("vol", to=args.to)
+    elif c == "shuffle":
+        snap = ctl("shuffle", mode=args.mode)
+    elif c == "repeat":
+        snap = ctl("repeat", **({"mode": args.mode} if args.mode else {}))
+    elif c == "eq":
+        kw = {}
+        if args.preset:
+            kw["preset"] = args.preset
+        if args.band is not None:
+            kw.update(band=args.band, gain=args.gain)
+        eq = ctl("eq", **kw)["eq"] if kw else ctl("status")["eq"]
+        print(f"eq: {eq['preset']}")
+        print("  " + "  ".join(f"{(str(b) if b < 1000 else str(b // 1000) + 'k'):>4}" for b in eq["bands"]))
+        print("  " + "  ".join(f"{g:>+4.0f}" for g in eq["gains"]))
+        print(f"presets: {', '.join(eq['presets'])}")
+        return
+    elif c == "queue":
+        snap = ctl("status")
+        print_now(snap)
+        con = db_connect()
+        s = json.loads(kv_get(con, "player") or "{}")
+        q, i = s.get("queue", []), s.get("idx", -1)
+        for n, sid in enumerate(q[i + 1:i + 1 + args.n], 1):
+            r = con.execute("SELECT artist, title, status FROM tracks WHERE sc_id=?", (sid,)).fetchone()
+            if r:
+                print(f"{n:>3}. {r['artist']} - {r['title']}{'' if r['status'] == 'archived' else '  [stream]'}")
+        return
+    else:  # now
+        snap = ctl("status")
+        if args.json:
+            print(json.dumps(snap, indent=1, ensure_ascii=False))
+            return
+    print_now(snap)
+
+
+# ---------------------------------------------------------------- audit
+
+def cmd_audit(args):
+    con = db_connect()
+    problems = 0
+    missing = []
+    for r in con.execute("SELECT sc_id, local_path FROM tracks WHERE status='archived'"):
+        p = Path(r["local_path"] or "")
+        if not r["local_path"] or not p.is_file() or p.stat().st_size < 10_000:
+            missing.append(r["sc_id"])
+    print(f"archived but missing/empty on disk: {len(missing)}")
+    problems += len(missing)
+    if missing and args.fix:
+        con.executemany("UPDATE tracks SET status='linked', local_path=NULL, attempts=0 WHERE sc_id=?",
+                        [(i,) for i in missing])
+        print(f"  requeued {len(missing)}")
+
+    referenced = {r[0] for r in con.execute("SELECT local_path FROM tracks WHERE local_path IS NOT NULL")}
+    orphans, size = [], 0
+    if LIBRARY_DIR.exists():
+        for f in LIBRARY_DIR.rglob("*"):
+            if f.suffix.lower() in AUDIO_EXTS and f.is_file() and EXPORT_DIR not in f.parents:
+                size += f.stat().st_size
+                if str(f) not in referenced:
+                    orphans.append(f)
+    print(f"audio files not in DB: {len(orphans)}")
+    for f in orphans[:10]:
+        print(f"  {f}")
+    print(f"library size: {size / 1e9:.2f} GB")
+
+    parts = list(LIBRARY_DIR.rglob("*.part")) if LIBRARY_DIR.exists() else []
+    if parts:
+        print(f"partial downloads (.part): {len(parts)} (resumed on the next attempt)")
+
+    if args.recheck:
+        rows = con.execute("SELECT sc_id, status FROM tracks WHERE unliked=0 AND "
+                           "status IN ('gone', 'preview_only', 'failed')").fetchall()
+        log(f"rechecking {len(rows)} tracks against the API...")
+        found = SoundCloud().tracks(r["sc_id"] for r in rows)
+        changed = 0
+        for r in rows:
+            t = found.get(r["sc_id"])
+            new = status_from_policy(t) if t else "gone"
+            if r["status"] == "failed" and new == "linked":
+                new = "failed"  # still reachable; `archive retry` requeues it
+            if new != r["status"]:
+                con.execute("UPDATE tracks SET status=?, attempts=0, policy=?, last_checked=? WHERE sc_id=?",
+                            (new, t.get("policy") if t else None, now_iso(), r["sc_id"]))
+                print(f"  {r['sc_id']}: {r['status']} -> {new}")
+                changed += 1
+        print(f"recheck: {changed} changed")
+    con.commit()
+
+    failed = con.execute("SELECT artist, title, error FROM tracks WHERE status='failed' AND unliked=0 "
+                         "LIMIT 10").fetchall()
+    if failed:
+        print("failed (first 10):")
+        for r in failed:
+            print(f"  {r['artist']} - {r['title']}: {(r['error'] or '')[:100]}")
+    print("counts:", json.dumps(archive_counts(con)))
+    sys.exit(1 if problems and not args.fix else 0)
+
+
+# ---------------------------------------------------------------- remote: play on another machine
+
+# One machine can play while another is its remote control, e.g. a desktop with the good speakers,
+# driven from a laptop. `sclikes play-on remote` stops the local daemon and starts `sclikes remote`
+# (sclikes-remote.service), which stands in for it here: it relays ctl.sock to the other machine's
+# daemon over ssh, mirrors that machine's state.json (plus its output volume) into the local one, and
+# owns the MPRIS name, so the panel, the CLI and the media keys all drive the remote player unchanged.
+# The remote machine runs a normal sclikes install; nothing else runs there beyond a small watcher
+# script piped over ssh.
+
+PLAY_ON = STATE_DIR / "play-on.json"      # {"on": "here"|"remote", "host": str, "busy": bool, "error": str}
+REMOTE_HOST = os.environ.get("SCLIKES_REMOTE") or load_config()["remote"]
+REMOTE_SOCK = STATE_DIR / "remote.sock"   # local end of the ssh forward to the remote's ctl.sock
+REMOTE_SYNC_STATE = STATE_DIR / "sync-remote.json"
+REMOTE_ART = HOME / ".cache/sclikes/remote-art"
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=2"]
+
+# Runs on the remote machine (python3 -c). Prints JSON lines: {"state": ...} whenever state.json changes,
+# {"sync": ...} for sync.json, and {"sysvol": ...} when the output volume or mute changes.
+REMOTE_WATCHER = r"""
+import json, os, re, select, subprocess, time
+d = os.path.expanduser("~/.local/state/sclikes")
+files = {"state": d + "/state.json", "sync": d + "/sync.json"}
+seen = {}
+def sysvol():
+    try:
+        run = lambda *a: subprocess.run(a, capture_output=True, text=True, timeout=3).stdout
+        sink = run("omarchy-audio-output-sink").strip() or "@DEFAULT_SINK@"
+        m = re.search(r"(\d+)%", run("pactl", "get-sink-volume", sink))
+        levels = {}  # every output's own level (the panel's balance control reads the speakers')
+        for o in json.loads(run("pactl", "-f", "json", "list", "sinks") or "[]"):
+            ch = list((o.get("volume") or {}).values())
+            if ch:
+                levels[o["name"]] = int(str(ch[0].get("value_percent", "0")).rstrip("%") or 0)
+        return {"volume": int(m.group(1)) if m else 0, "muted": "yes" in run("pactl", "get-sink-mute", sink),
+                "sink": run("pactl", "get-default-sink").strip(), "sinks": levels}
+    except Exception:
+        return None
+def emit(k, v):
+    print(json.dumps({k: v}), flush=True)
+sub = subprocess.Popen(["stdbuf", "-oL", "pactl", "subscribe"], stdout=subprocess.PIPE)  # else events come in 4K batches
+vol, last_vol, beat = None, 0, 0
+while True:
+    r = select.select([sub.stdout], [], [], 0.25)[0]
+    changed = False
+    if r:
+        chunk = os.read(sub.stdout.fileno(), 65536)
+        changed = b" on sink #" in chunk or b" on server" in chunk
+    for k, p in files.items():
+        try:
+            st = os.stat(p)
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if key != seen.get(k):
+            try:
+                with open(p) as f:
+                    emit(k, json.load(f))
+                seen[k] = key
+            except (OSError, ValueError):
+                seen[k] = None
+    now = time.monotonic()
+    if changed or now - last_vol > 10:
+        last_vol = now
+        v = sysvol()
+        if v != vol:
+            vol = v
+            emit("sysvol", v)
+    if now - beat > 5:
+        beat = now
+        emit("hb", 1)
+"""
+
+
+def write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    tmp.replace(path)
+
+
+def play_on_read():
+    try:
+        return json.loads(PLAY_ON.read_text())
+    except (OSError, ValueError):
+        return {"on": "here", "busy": False, "error": ""}
+
+
+def ctl_try(cmd, timeout=5, **args):
+    """One best-effort request to whatever is serving ctl.sock; None if nothing answers."""
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(timeout)
+            s.connect(str(CTL_SOCK))
+            s.sendall(json.dumps({"cmd": cmd, "args": args}).encode() + b"\n")
+            return json.loads(s.makefile("rb").readline() or b"null")
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_config(args):
+    c = load_config()
+    if not args.key:
+        print(json.dumps(c, indent=1))
+        return
+    if args.value is None:
+        print(c[args.key])
+        return
+    v = args.value
+    if args.key == "archive":
+        if v not in ("on", "off"):
+            sys.exit("archive: on | off")
+        v = v == "on"
+    c[args.key] = v
+    write_json_atomic(CONFIG_PATH, c)
+    print(f"{args.key}: {json.dumps(v)}")
+    if args.key == "archive" and v:
+        print("archiving is on; the daemon starts on the queue within a few seconds")
+
+
+def cmd_play_on(args):
+    cur = play_on_read()
+    if not args.where:
+        print(cur.get("on", "here") + (f"  ({cur['error']})" if cur.get("error") else ""))
+        return
+    where = args.where
+    systemctl = lambda *a: subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True)
+    units = HOME / ".config/systemd/user"
+
+    def autostart(unit, on):
+        """Start at login or not. The units are symlinks into the plugin, and `systemctl disable`
+        would delete that link too, so the default.target.wants entry is managed by hand."""
+        link = units / "default.target.wants" / unit
+        link.unlink(missing_ok=True)
+        if on:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(os.path.realpath(units / unit))
+    write_json_atomic(PLAY_ON, {**cur, "busy": True, "error": ""})
+    if where == "remote" and not REMOTE_HOST:
+        write_json_atomic(PLAY_ON, {**cur, "busy": False, "error": "No remote set (sclikes config remote <ssh-host>)"})
+        sys.exit("no remote machine set: run `sclikes config remote <ssh-host>`")
+    if where == "remote":
+        ok = subprocess.run(["ssh", *SSH_OPTS, REMOTE_HOST, "true"], capture_output=True).returncode == 0
+        if not ok:
+            write_json_atomic(PLAY_ON, {**cur, "busy": False, "error": f"Can't reach {REMOTE_HOST}"})
+            sys.exit(f"can't reach {REMOTE_HOST}; still playing {cur.get('on', 'here')}")
+        if cur.get("on") != "remote":
+            ctl_try("pause", on=True)  # this machine falls silent as the remote takes over
+        autostart("sclikes.service", False)
+        autostart("sclikes-remote.service", True)
+        systemctl("daemon-reload")
+        r = systemctl("start", "sclikes-remote.service")  # Conflicts= stops sclikes.service first
+    else:
+        if cur.get("on") == "remote":
+            ctl_try("pause", on=True)  # don't leave the remote playing to an empty room
+        autostart("sclikes-remote.service", False)
+        autostart("sclikes.service", True)
+        systemctl("daemon-reload")
+        r = systemctl("start", "sclikes.service")  # Conflicts= stops sclikes-remote.service first
+    err = "" if r.returncode == 0 else (r.stderr.strip() or "systemctl failed")
+    write_json_atomic(PLAY_ON, {"on": where, "host": REMOTE_HOST, "busy": False, "error": err})
+    print(("playing here" if where == "here" else f"playing on {REMOTE_HOST}") + (f" ({err})" if err else ""))
+
+
+class RemotePlayer:
+    """What Mpris needs from a Player, backed by the remote's snapshots and ctl.sock."""
+
+    class _Props:
+        def __init__(self, rp):
+            self.rp = rp
+
+        def get(self, key, default=None):
+            if key != "time-pos":
+                return default
+            s = self.rp.snap
+            pos = s.get("pos") or 0
+            if s.get("state") == "playing":
+                pos += max(0.0, time.time() - (s.get("pos_at") or time.time()))
+            return pos
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.snap = {"state": "stopped", "track": None, "queue_len": 0}
+        self.on_publish = []
+        self.props = self._Props(self)
+
+    @property
+    def entry_id(self):
+        return (self.snap.get("track") or {}).get("sc_id") if self.snap.get("state") != "stopped" else None
+
+    def snapshot(self):
+        return self.snap
+
+    def publish(self, snap):
+        if not snap or "state" not in snap:
+            return
+        self.snap = snap
+        for fn in self.on_publish:
+            fn(snap)
+
+    def dispatch(self, cmd, args):
+        r = self.bridge.request(cmd, args)
+        if not r.get("ok"):
+            raise PlayerError(r.get("error") or "remote error")
+        if isinstance(r.get("data"), dict) and "state" in r["data"]:
+            self.publish(self.bridge.fix_snapshot(r["data"]))
+        return r.get("data")
+
+
+class RemoteBridge:
+    def __init__(self, host):
+        self.host = host
+        self.connected = threading.Event()
+        self.error = "connecting…"
+        self.rig_state, self.sysvol = {}, None
+        self.lock = threading.Lock()
+        self.fetching = set()
+        self.orphans = set()      # clients served while the remote was away; dropped when it's back
+        self.player = RemotePlayer(self)
+        self.proc = None
+
+    # -- art: the remote's paths often exist here too (same library); otherwise fetch a copy
+    def local_art(self, art):
+        if not art or not art.startswith("/") or os.path.isfile(art):
+            return art
+        cached = REMOTE_ART / (re.sub(r"[^\w.-]", "_", Path(art).stem)[-80:] + Path(art).suffix)
+        if cached.is_file():
+            return str(cached)
+        if art not in self.fetching:
+            self.fetching.add(art)
+            threading.Thread(target=self._fetch_art, args=(art, cached), daemon=True).start()
+        return ""
+
+    def _fetch_art(self, art, cached):
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_suffix(".part")
+        try:
+            with open(tmp, "wb") as f:
+                ok = subprocess.run(["ssh", *SSH_OPTS, self.host, "cat -- " + shlex.quote(art)],
+                                    stdout=f, stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+            if ok and tmp.stat().st_size:
+                tmp.replace(cached)
+                self.write_state()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+            self.fetching.discard(art)
+
+    def fix_snapshot(self, snap):
+        t = snap.get("track")
+        if t and t.get("art"):
+            snap = {**snap, "track": {**t, "art": self.local_art(t["art"])}}
+        return snap
+
+    # -- state.json here = the remote's, plus sysvol and the link status
+    def write_state(self):
+        with self.lock:
+            st = dict(self.rig_state)
+            player = st.get("player")
+            if player:
+                player = self.fix_snapshot(player)
+                if not self.connected.is_set() and player.get("state") != "stopped":
+                    player = {**player, "state": "stopped", "error": self.error}
+                st["player"] = player
+            st["sysvol"] = self.sysvol
+            st["remote"] = {"host": self.host, "connected": self.connected.is_set(),
+                            "error": "" if self.connected.is_set() else self.error}
+            st["updated"] = now_iso()
+            write_json_atomic(STATE_PATH, st)
+
+    def set_link(self, up, error=""):
+        was = self.connected.is_set()
+        if up:
+            self.connected.set()
+        else:
+            self.connected.clear()
+            self.error = error
+        if up != was:
+            log(f"remote: {'connected to ' + self.host if up else 'lost ' + self.host + ': ' + error}")
+            if up:
+                for c in list(self.orphans):  # make them reconnect, this time to the remote
+                    try:
+                        c.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+        self.write_state()
+
+    # -- the ssh link: one connection carries the ctl.sock forward and the watcher's output
+    def link_loop(self, stop):
+        remote_ctl = None
+        while not stop.is_set():
+            if not remote_ctl:  # the remote's own path to its ctl.sock (its home may not match ours)
+                r = subprocess.run(["ssh", *SSH_OPTS, self.host, 'printf %s "$HOME"'],
+                                   capture_output=True, text=True)
+                if r.returncode != 0 or not r.stdout.startswith("/"):
+                    err = (r.stderr.strip().splitlines() or [f"ssh exited ({r.returncode})"])[-1]
+                    self.set_link(False, self.reason(err))
+                    stop.wait(5)
+                    continue
+                remote_ctl = f"{r.stdout}/.local/state/sclikes/ctl.sock"
+            REMOTE_SOCK.unlink(missing_ok=True)
+            # Its own connection, never a shared ControlMaster one: a forward made through a shared
+            # master vanishes when whichever client set it up first goes away.
+            cmd = ["ssh", *SSH_OPTS, "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                   "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
+                   "-L", f"{REMOTE_SOCK}:{remote_ctl}", self.host, "python3 -u -c " + shlex.quote(REMOTE_WATCHER)]
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             stdin=subprocess.DEVNULL)
+            except OSError as e:
+                self.set_link(False, str(e))
+                stop.wait(5)
+                continue
+            for line in self.proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not self.connected.is_set():
+                    self.set_link(True)
+                if "state" in msg:
+                    self.rig_state = msg["state"] if isinstance(msg["state"], dict) else {}
+                    self.player.publish(self.fix_snapshot(self.rig_state.get("player") or {}))
+                    self.write_state()
+                elif "sync" in msg:
+                    write_json_atomic(REMOTE_SYNC_STATE, msg["sync"])
+                elif "sysvol" in msg:
+                    self.sysvol = msg["sysvol"]
+                    self.write_state()
+            self.proc.wait()
+            err = (self.proc.stderr.read() or b"").decode(errors="replace").strip().splitlines()
+            self.set_link(False, self.reason(err[-1] if err else f"ssh exited ({self.proc.returncode})"))
+            stop.wait(5)
+
+    def reason(self, err):
+        if any(k in err for k in ("No route to host", "timed out", "Could not resolve", "Network is unreachable",
+                                  "Connection refused")):
+            return f"Can't reach {self.host}"
+        return err
+
+    def relink(self, why):
+        """The forward is broken although ssh is up: drop the link, and link_loop starts it over."""
+        log(f"remote: {why}; reconnecting")
+        self.set_link(False, f"reconnecting to {self.host}…")
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def request(self, cmd, args, timeout=10):
+        """One request to the remote daemon (for MPRIS); returns the reply dict."""
+        if not self.connected.is_set():
+            return {"ok": False, "error": self.error}
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(timeout)
+                s.connect(str(REMOTE_SOCK))
+                s.sendall(json.dumps({"cmd": cmd, "args": args}).encode() + b"\n")
+                return json.loads(s.makefile("rb").readline() or b'{"ok": false, "error": "no reply"}')
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": f"{self.host}: {e}"}
+
+
+class RemoteProxyHandler(socketserver.StreamRequestHandler):
+    """A panel/CLI connection to ctl.sock, relayed line by line to the remote daemon."""
+
+    def handle(self):
+        bridge = self.server.bridge
+        up = None
+        if bridge.connected.is_set():
+            try:
+                up = socket.socket(socket.AF_UNIX)
+                up.connect(str(REMOTE_SOCK))
+            except OSError as e:
+                up.close()
+                up = None
+                bridge.relink(f"forward to {bridge.host} is gone ({e.strerror})")
+        if up is None:
+            return self.orphan(bridge)
+        threading.Thread(target=self.pump_up, args=(up,), daemon=True).start()
+        try:
+            for line in up.makefile("rb"):
+                if not line.startswith(b'{"viz"') and b'"art"' in line:
+                    try:
+                        r = json.loads(line)
+                        if isinstance(r.get("data"), dict) and "track" in r["data"]:
+                            r["data"] = bridge.fix_snapshot(r["data"])
+                            line = json.dumps(r, ensure_ascii=False).encode() + b"\n"
+                    except ValueError:
+                        pass
+                self.connection.sendall(line)
+        except OSError:
+            pass
+        finally:
+            up.close()
+
+    def pump_up(self, up):
+        try:
+            for line in self.rfile:
+                up.sendall(line)
+        except OSError:
+            pass
+        try:
+            up.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def orphan(self, bridge):
+        """The remote is away: answer every request with why, until it's back."""
+        bridge.orphans.add(self.connection)
+        try:
+            for line in self.rfile:
+                try:
+                    req = json.loads(line)
+                except ValueError:
+                    continue
+                resp = {"ok": False, "error": bridge.error or f"Can't reach {bridge.host}",
+                        "cmd": req.get("cmd")}
+                if "id" in req:
+                    resp["id"] = req["id"]
+                self.connection.sendall(json.dumps(resp).encode() + b"\n")
+        except OSError:
+            pass
+        finally:
+            bridge.orphans.discard(self.connection)
+
+
+class RemoteProxy(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        CTL_SOCK.unlink(missing_ok=True)
+        old = os.umask(0o077)
+        try:
+            super().__init__(str(CTL_SOCK), RemoteProxyHandler)
+        finally:
+            os.umask(old)
+
+
+def cmd_remote(args):
+    stop = threading.Event()
+    host = args.host or REMOTE_HOST
+    if not host:
+        sys.exit("no remote machine set: run `sclikes config remote <ssh-host>`")
+    bridge = RemoteBridge(host)
+    bridge.write_state()
+    server = RemoteProxy(bridge)
+    threading.Thread(target=server.serve_forever, daemon=True, name="proxy").start()
+    mpris = None
+    try:
+        mpris = Mpris(bridge.player)
+        mpris.start()
+    except ImportError as e:
+        log(f"mpris: python-gobject missing ({e}); media keys won't reach the remote")
+    link = threading.Thread(target=bridge.link_loop, args=(stop,), daemon=True, name="link")
+    link.start()
+
+    def on_term(*_):
+        stop.set()
+        if bridge.proc and bridge.proc.poll() is None:
+            bridge.proc.terminate()
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    log(f"remote: playing on {bridge.host}; this machine is the remote control")
+    while not stop.wait(1):
+        pass
+    server.shutdown()
+    CTL_SOCK.unlink(missing_ok=True)
+    REMOTE_SOCK.unlink(missing_ok=True)
+    if mpris:
+        mpris.stop()
+
+
+def main():
+    p = argparse.ArgumentParser(prog="sclikes", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("sync", help="pull likes into the DB")
+    s.add_argument("--full", action="store_true", help="walk all likes and flag unliked tracks")
+    s.add_argument("--user", help="SoundCloud profile name (default: `sclikes config user`)")
+    s.add_argument("--export", action="store_true", help="write exports afterwards")
+    s.set_defaults(func=cmd_sync)
+
+    e = sub.add_parser("export", help="write M3U/CSV/JSON")
+    e.add_argument("--format", choices=["m3u", "csv", "json", "all"], default="all")
+    e.add_argument("--out", default=str(EXPORT_DIR))
+    e.add_argument("--include-unliked", action="store_true")
+    e.set_defaults(func=cmd_export)
+
+    st = sub.add_parser("stats", help="library counts")
+    st.set_defaults(func=cmd_stats)
+
+    a = sub.add_parser("archive", help="download queue")
+    a.add_argument("action", nargs="?", default="run",
+                   choices=["run", "pause", "resume", "retry", "status"])
+    a.add_argument("--limit", type=int)
+    a.add_argument("--id", type=int, help="archive this one track now")
+    a.set_defaults(func=cmd_archive)
+
+    au = sub.add_parser("audit", help="verify files vs DB")
+    au.add_argument("--fix", action="store_true", help="requeue archived tracks whose file is missing")
+    au.add_argument("--recheck", action="store_true", help="re-query gone/preview/failed tracks")
+    au.set_defaults(func=cmd_audit)
+
+    d = sub.add_parser("daemon", help="long-running worker")
+    d.set_defaults(func=cmd_daemon)
+    cf = sub.add_parser("config", help="settings: user, archive on|off, remote ssh host")
+    cf.add_argument("key", nargs="?", choices=list(CONFIG_DEFAULTS))
+    cf.add_argument("value", nargs="?")
+    cf.set_defaults(func=cmd_config)
+    po = sub.add_parser("play-on", help="play here, or on the remote machine with this one as its remote control")
+    po.add_argument("where", nargs="?", choices=["here", "remote"])
+    po.set_defaults(func=cmd_play_on)
+    rm = sub.add_parser("remote", help="stand-in daemon that relays to the remote machine (sclikes-remote.service)")
+    rm.add_argument("--host", help="ssh host (default: `sclikes config remote`, or $SCLIKES_REMOTE)")
+    rm.set_defaults(func=cmd_remote)
+
+    pl = sub.add_parser("play", help="start/resume playback, or play a track/filter")
+    pl.add_argument("id", nargs="?", type=int, help="SoundCloud track id")
+    pl.add_argument("-q", "--query", help="title/artist/genre contains")
+    pl.add_argument("--artist", help="exact artist (case-insensitive)")
+    pl.add_argument("--local", action="store_true", help="archived tracks only (no streaming)")
+    pl.add_argument("--genre", help="exact genre (case-insensitive)")
+    pl.add_argument("--view", choices=list(VIEWS), help="library view (default all)")
+    pl.add_argument("--sort", choices=list(SORTS), help="queue order (default liked)")
+    pl.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=None)
+    pa = sub.add_parser("pause", help="toggle pause")
+    pa.add_argument("--on", action="store_const", const=True, dest="on")
+    pa.add_argument("--off", action="store_const", const=False, dest="on")
+    for name in ("stop", "next", "prev"):
+        sub.add_parser(name, help=f"{name} track" if name != "stop" else "stop playback")
+    sk = sub.add_parser("seek", help="+10 | -10 | 90 | 1:30 | 50%%")
+    sk.add_argument("to")
+    v = sub.add_parser("vol", help="+5 | -5 | 60")
+    v.add_argument("to")
+    sh = sub.add_parser("shuffle", help="shuffle on/off/toggle")
+    sh.add_argument("mode", nargs="?", default="toggle", choices=["on", "off", "toggle"])
+    rp = sub.add_parser("repeat", help="repeat off/all/one (no arg cycles)")
+    rp.add_argument("mode", nargs="?", choices=["off", "all", "one"])
+    nw = sub.add_parser("now", help="what's playing")
+    nw.add_argument("--json", action="store_true")
+    qu = sub.add_parser("queue", help="show the next tracks")
+    qu.add_argument("-n", type=int, default=10)
+    eqp = sub.add_parser("eq", help="equalizer: show, pick a preset, or set one band")
+    eqp.add_argument("preset", nargs="?", choices=list(EQ_PRESETS))
+    eqp.add_argument("--band", type=int, choices=range(len(EQ_BANDS)), help="band index 0-9 (31 Hz … 16 kHz)")
+    eqp.add_argument("--gain", type=float, default=0, help=f"dB, ±{EQ_MAX_DB}")
+    for name in ("play", "pause", "stop", "next", "prev", "seek", "vol", "shuffle", "repeat", "now", "queue", "eq"):
+        sub.choices[name].set_defaults(func=cmd_player)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
