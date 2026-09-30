@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.papershoes22.sclikes",
-  "name": "SoundCloud Likes Player",
+  "name": "Deep Shuffle for SoundCloud",
   "version": "0.1.0",
   "author": "papershoes22",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "SoundCloud Likes Player",
+    "displayName": "Deep Shuffle for SoundCloud",
     "description": "Now playing from your SoundCloud likes, with true whole-library shuffle, a player dropdown and a full library window.",
     "category": "Media",
     "aliases": [

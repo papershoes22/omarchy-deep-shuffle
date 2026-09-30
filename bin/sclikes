@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sclikes: a player for your SoundCloud likes, with an optional local archive.
+"""sclikes (Deep Shuffle for SoundCloud): a player for your SoundCloud likes, with an optional local archive.
 
 Setup:
   sclikes config user <name>         your SoundCloud profile name (soundcloud.com/<name>)
@@ -1555,7 +1555,7 @@ class Mpris:
                 md["mpris:artUrl"] = ("s", "file://" + urllib.parse.quote(art) if art.startswith("/") else art)
         props = {
             "org.mpris.MediaPlayer2": {
-                "CanQuit": False, "CanRaise": True, "HasTrackList": False, "Identity": "SoundCloud Likes",
+                "CanQuit": False, "CanRaise": True, "HasTrackList": False, "Identity": "Deep Shuffle",
                 "SupportedUriSchemes": [], "SupportedMimeTypes": []},
             MPRIS_PLAYER: {
                 "PlaybackStatus": {"playing": "Playing", "loading": "Playing", "paused": "Paused"}.get(state, "Stopped"),

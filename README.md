@@ -1,4 +1,4 @@
-# SoundCloud Likes Player (Omarchy plugin)
+# Deep Shuffle for SoundCloud (Omarchy plugin)
 
 ![The full player, filtered to one artist](preview.png)
 
@@ -94,8 +94,8 @@ Your likes must be public on SoundCloud (the default). Nothing here asks for you
 
 Optional hotkeys, for `~/.config/hypr/bindings.lua`:
 
-    o.bind("SUPER + CTRL + M", "SoundCloud likes", "omarchy-shell io.github.papershoes22.sclikes toggle")
-    o.bind("SUPER + ALT + M", "SoundCloud likes (full player)", "omarchy-shell io.github.papershoes22.sclikes expand")
+    o.bind("SUPER + CTRL + M", "Deep Shuffle", "omarchy-shell io.github.papershoes22.sclikes toggle")
+    o.bind("SUPER + ALT + M", "Deep Shuffle (full player)", "omarchy-shell io.github.papershoes22.sclikes expand")
 
 `hypr/sclikes.lua` is an optional window rule that floats the full player on a laptop's built-in screen (see the
 comment inside for how to load it).
