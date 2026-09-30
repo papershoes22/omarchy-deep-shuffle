@@ -6,10 +6,32 @@ A player for your SoundCloud likes that lives in the Omarchy bar. It pulls your 
 and plays them with mpv. Searching, shuffling, the EQ and media keys work the same whether a track streams or
 is stored locally.
 
+**Its shuffle covers all of your likes, not just the recent ones.** A web player can only shuffle what the page
+has loaded, and loading thousands of likes by scrolling is slow, especially on older machines. So shuffling a
+big collection in a browser tends to keep replaying your newest likes. sclikes keeps your whole likes list
+locally, so every shuffle draws from all of it. See [Shuffle](#shuffle-that-covers-all-your-likes).
+
 Optional extras:
 - **Archive:** keep local copies of your likes for offline listening. Off by default; see [Archiving](#archiving-optional).
 - **Play on another machine:** e.g. a desktop with better speakers, driven from your laptop. See
   [Play on another machine](#play-on-another-machine-optional).
+
+## Shuffle that covers all your likes
+
+Your full likes list is synced into a local database (once a day, and whenever you hit **Sync now**), so shuffle
+never depends on what a page happens to have loaded.
+
+- **Every like has the same chance.** The whole list is shuffled up front, so a like from years ago is as likely
+  to come up next as one from yesterday.
+- **No repeats until you've heard everything.** Shuffle deals your likes like a shuffled deck: each lap plays every
+  track once. With repeat on, the next lap is a fresh shuffle.
+- **It remembers where you are.** The shuffled order and your place in it are saved, so a restart or reboot
+  carries on instead of reshuffling.
+- **Shuffle any slice the same way:** one artist, one genre, a search, or only what's stored locally.
+- **It's light.** It's just a list of track IDs in memory, so thousands of likes shuffle instantly, even on old
+  hardware. Tracks that can't play (DRM, removed from SoundCloud) are skipped automatically.
+
+Turn it on with the shuffle button, `s` in the dropdown, or `sclikes shuffle on`.
 
 ## What you get
 

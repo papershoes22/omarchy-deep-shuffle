@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "papershoes22",
   "license": "MIT",
-  "description": "A player for your SoundCloud likes, in the bar. The pill shows what's playing, with a progress line; the dropdown has cover art, a scrubber, transport and volume, a 10-band EQ, what's up next, and a full library window with search. Optional: keep local copies of your likes (off by default), and play on another machine with this one as the remote. Runs in the bundled `sclikes` user service (mpv + yt-dlp).",
+  "description": "A player for your SoundCloud likes, in the bar. Its shuffle covers your entire likes library: every like has an equal chance and nothing repeats until you've heard them all, instead of cycling the recent likes a web page happens to have loaded. The pill shows what's playing, with a progress line; the dropdown has cover art, a scrubber, transport and volume, a 10-band EQ, what's up next, and a full library window with search. Optional: keep local copies of your likes (off by default), and play on another machine with this one as the remote. Runs in the bundled `sclikes` user service (mpv + yt-dlp).",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "SoundCloud Likes Player",
-    "description": "Now playing from your SoundCloud likes, with a player dropdown and a full library window.",
+    "description": "Now playing from your SoundCloud likes, with true whole-library shuffle, a player dropdown and a full library window.",
     "category": "Media",
     "aliases": [
       "soundcloud",
