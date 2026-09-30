@@ -1,9 +1,0 @@
-[Unit]
-Description=sclikes: sync SoundCloud likes (full reconcile weekly) and refresh exports
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/sclikes sync --export
-Nice=10

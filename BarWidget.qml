@@ -9,7 +9,7 @@ import "Model.js" as Model
 //   left: dropdown · middle: play/pause · right: next · scroll: volume
 BarWidget {
   id: root
-  moduleName: "io.github.papershoes22.sclikes"
+  moduleName: "io.github.papershoes22.deepshuffle"
 
   function injectPanel() {
     var target = panelLoader.item

@@ -1,5 +1,5 @@
 [Unit]
-Description=sclikes: daily likes sync
+Description=deepshuffle: daily likes sync
 
 [Timer]
 OnCalendar=daily

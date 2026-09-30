@@ -1,11 +1,11 @@
 [Unit]
-Description=sclikes: SoundCloud likes player (mpv) + optional archiver
+Description=deepshuffle: SoundCloud likes player (mpv) + optional archiver
 After=network-online.target graphical-session.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/sclikes daemon
+ExecStart=%h/.local/bin/deepshuffle daemon
 Restart=on-failure
 RestartSec=30
 # SIGTERM only the daemon (it quits mpv itself and gives the current download up to 30s);

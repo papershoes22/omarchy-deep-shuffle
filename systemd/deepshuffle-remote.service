@@ -1,0 +1,15 @@
+[Unit]
+Description=deepshuffle: remote control for another machine's player (ssh bridge; the other machine plays)
+# Only one deepshuffle backend at a time: starting this stops the local player, and waits for it to exit.
+Conflicts=deepshuffle.service
+After=deepshuffle.service network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/deepshuffle remote
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

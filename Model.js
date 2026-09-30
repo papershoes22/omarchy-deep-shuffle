@@ -1,6 +1,6 @@
 .pragma library
 
-// Pure helpers for the sclikes widget: formatting, badges, archive progress.
+// Pure helpers for the deepshuffle widget: formatting, badges, archive progress.
 // No QML types in here.
 
 var PLAY = "󰐊", PAUSE = "󰏤", PREV = "󰒮", NEXT = "󰒭", STOP = "󰓛"
@@ -228,7 +228,7 @@ function groupBars(bars, n) {
   return out
 }
 
-// ---- manual sync (sync.json, written by `sclikes sync`)
+// ---- manual sync (sync.json, written by `deepshuffle sync`)
 var SYNC_STALE = 10 * 60   // a "running" older than this was killed mid-way
 
 function isoSecs(iso) { var t = Date.parse(iso || ""); return isNaN(t) ? 0 : t / 1000 }

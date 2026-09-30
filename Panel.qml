@@ -8,30 +8,30 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Dropdown for sclikes, in two sizes:
+// Dropdown for deepshuffle, in two sizes:
 //  - compact: now playing, scrubber, transport, volume, up next, archive progress
 //  - expanded (⤢): a full player in its own window (a normal Hyprland toplevel, so it stays
 //    open while you work elsewhere), with a library sidebar (views, genres, artists), a
 //    searchable, sortable track list, and the compact body as the now-playing column
-// Data comes from two places. state.json is written by the `sclikes` daemon about once a
+// Data comes from two places. state.json is written by the `deepshuffle` daemon about once a
 // second while playing (sections "player" and "archive"). A persistent connection to
 // ctl.sock sends commands; each request carries an id, and its reply is routed back to
 // the caller. Player commands reply with a fresh player snapshot.
-// Play on a remote machine (`sclikes play-on remote`): the local daemon stops and `sclikes remote`
+// Play on a remote machine (`deepshuffle play-on remote`): the local daemon stops and `deepshuffle remote`
 // serves the same ctl.sock and state.json, relayed from the other machine's daemon over ssh, so
 // everything here works unchanged. Only volume (the remote's output, reported in state.json's sysvol)
 // and sync go their own way.
 Panel {
   id: root
-  moduleName: "io.github.papershoes22.sclikes"
-  ipcTarget: "io.github.papershoes22.sclikes"
+  moduleName: "io.github.papershoes22.deepshuffle"
+  ipcTarget: "io.github.papershoes22.deepshuffle"
   manageIpc: false
 
   property var anchorItem: null
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/sclikes"
+  readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/deepshuffle"
   readonly property string themeColorsPath: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
 
   property var st: null          // whole state.json
@@ -108,8 +108,8 @@ Panel {
   readonly property bool sysMuted: remoteMode ? (remoteVol ? remoteVol.muted : false)
                                    : sysSink && sysSink.audio ? sysSink.audio.muted : false
 
-  // ---- where the music plays (play-on.json, written by `sclikes play-on`); the remote machine is
-  // optional (`sclikes config remote <ssh-host>`), and the switch only shows once one is set
+  // ---- where the music plays (play-on.json, written by `deepshuffle play-on`); the remote machine is
+  // optional (`deepshuffle config remote <ssh-host>`), and the switch only shows once one is set
   property var playOnInfo: ({ on: "here", busy: false, error: "" })
   property var config: ({})
   readonly property bool remoteMode: playOnInfo.on === "remote"
@@ -135,10 +135,10 @@ Panel {
   readonly property bool pillActive: daemonUp && pstate === "playing"
   readonly property real pillProgress: duration > 0 && pstate !== "stopped" ? pos / duration : 0
   readonly property string tooltip: {
-    if (!daemonUp) return "sclikes: daemon not running (systemctl --user start sclikes)"
+    if (!daemonUp) return "deepshuffle: daemon not running (systemctl --user start deepshuffle)"
     var s = track ? track.artist + " – " + track.title + "\n" + Model.clock(pos) + " / " + Model.clock(duration)
                     + " · " + (track.source === "local" ? "local" : "streaming")
-                  : "sclikes: nothing queued"
+                  : "deepshuffle: nothing queued"
     if (pstate === "stopped") s = "Stopped" + (track ? " · " + track.artist + " – " + track.title : "")
     if (progress) s += "\nArchive " + Model.thousands(progress.archived) + " / " + Model.thousands(progress.archivable)
                        + " · " + Model.archiveStateLabel(archive)
@@ -174,7 +174,7 @@ Panel {
 
   function send(cmd, args, cb) {
     if (!ctl.connected) {
-      root.cmdError = "The sclikes daemon isn't running"
+      root.cmdError = "The deepshuffle daemon isn't running"
       ctl.connected = true
       return
     }
@@ -219,7 +219,7 @@ Panel {
     if (root.playOnInfo.busy) return
     if (where === root.playOnInfo.on && !root.playOnError) return
     root.playOnInfo = Object.assign({}, root.playOnInfo, { busy: true, error: "" })
-    run([Quickshell.env("HOME") + "/.local/bin/sclikes", "play-on", where])
+    run([Quickshell.env("HOME") + "/.local/bin/deepshuffle", "play-on", where])
   }
   function toggleShuffle() { send("shuffle", { mode: "toggle" }) }
   function cycleRepeat() { send("repeat") }
@@ -255,18 +255,18 @@ Panel {
   readonly property string screenName: root.anchorWindow && root.anchorWindow.screen ? String(root.anchorWindow.screen.name) : ""
   readonly property bool internalScreen: /^(eDP|LVDS|DSI)/.test(root.screenName)
   readonly property bool pillViz: pillVizMode === "On" || (pillVizMode === "External" && !internalScreen)
-  function setPillVizMode(mode) { run(["omarchy", "bar", "set", "io.github.papershoes22.sclikes", "pillVisualizer", mode]) }
+  function setPillVizMode(mode) { run(["omarchy", "bar", "set", "io.github.papershoes22.deepshuffle", "pillVisualizer", mode]) }
   // Widget setting: "Vivid" tints the pill with the cover's colour (capsule, thumbnail, hue-shifted bars,
   // bass glow riding the spectrum frames) or "Classic" (plain bar text).
   readonly property string pillStyle: String(setting("pillStyle", "Vivid"))
   readonly property bool pillVivid: pillStyle !== "Classic"
-  function setPillStyle(mode) { run(["omarchy", "bar", "set", "io.github.papershoes22.sclikes", "pillStyle", mode]) }
+  function setPillStyle(mode) { run(["omarchy", "bar", "set", "io.github.papershoes22.deepshuffle", "pillStyle", mode]) }
   // Accent hue for hue-shifted pill bars; achromatic theme accents report -1.
   readonly property real accentHue: accent.hslHue >= 0 ? accent.hslHue : 0.6
   // Widget setting: a glow across this bar that pulses with the bass ("On" | "External" | "Off").
   readonly property string barGlowMode: String(setting("barGlow", "Off"))
   readonly property bool barGlow: barGlowMode === "On" || (barGlowMode === "External" && !internalScreen)
-  function setBarGlowMode(mode) { run(["omarchy", "bar", "set", "io.github.papershoes22.sclikes", "barGlow", mode]) }
+  function setBarGlowMode(mode) { run(["omarchy", "bar", "set", "io.github.papershoes22.deepshuffle", "barGlow", mode]) }
   // One-click toggle (full player, g): Off <-> the last mode that wasn't Off, so "External" survives.
   property string lastGlowMode: "On"
   onBarGlowModeChanged: if (barGlowMode !== "Off") lastGlowMode = barGlowMode
@@ -306,21 +306,21 @@ Panel {
   }
   function run(argv) { Util.execArgv(argv) }
   readonly property bool archiveOff: archive !== null && archive.state === "off"
-  function setArchiving(on) { run([Quickshell.env("HOME") + "/.local/bin/sclikes", "config", "archive", on ? "on" : "off"]) }
+  function setArchiving(on) { run([Quickshell.env("HOME") + "/.local/bin/deepshuffle", "config", "archive", on ? "on" : "off"]) }
   function toggleArchive() {
-    run(["sclikes", "archive", archive && archive.paused ? "resume" : "pause"])
+    run(["deepshuffle", "archive", archive && archive.paused ? "resume" : "pause"])
   }
   function syncNow() {
     if (root.syncing) return
     root.syncRequested = true
     syncRequestTimeout.restart()
     if (root.remoteMode) run(["ssh", "-o", "BatchMode=yes", root.remoteHost,
-                           "systemctl --user start --no-block sclikes-sync.service"])
-    else run(["systemctl", "--user", "start", "--no-block", "sclikes-sync.service"])
+                           "systemctl --user start --no-block deepshuffle-sync.service"])
+    else run(["systemctl", "--user", "start", "--no-block", "deepshuffle-sync.service"])
   }
   Timer { id: syncRequestTimeout; interval: 20 * 1000; onTriggered: root.syncRequested = false }
   function startDaemon() {
-    run(["systemctl", "--user", "start", root.remoteMode ? "sclikes-remote.service" : "sclikes.service"])
+    run(["systemctl", "--user", "start", root.remoteMode ? "deepshuffle-remote.service" : "deepshuffle.service"])
     reconnect.restart()
   }
 
@@ -451,7 +451,7 @@ Panel {
   }
 
   FileView {
-    path: Quickshell.env("HOME") + "/.config/sclikes/config.json"
+    path: Quickshell.env("HOME") + "/.config/deepshuffle/config.json"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
@@ -470,7 +470,7 @@ Panel {
     }
   }
 
-  // Playing remotely, sync status is the remote's (mirrored by `sclikes remote`).
+  // Playing remotely, sync status is the remote's (mirrored by `deepshuffle remote`).
   FileView {
     path: root.stateDir + (root.remoteMode ? "/sync-remote.json" : "/sync.json")
     watchChanges: true
@@ -527,21 +527,21 @@ Panel {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
-    // omarchy-shell io.github.papershoes22.sclikes expand   (open straight into the full player)
+    // omarchy-shell io.github.papershoes22.deepshuffle expand   (open straight into the full player)
     function expand(): void { root.setExpanded(true) }
     function collapse(): void { root.expanded = false }
-    // omarchy-shell io.github.papershoes22.sclikes sync   (check SoundCloud for new likes now)
+    // omarchy-shell io.github.papershoes22.deepshuffle sync   (check SoundCloud for new likes now)
     function sync(): void { root.syncNow() }
-    // omarchy-shell io.github.papershoes22.sclikes search "hucci"   (full player, filtered)
+    // omarchy-shell io.github.papershoes22.deepshuffle search "hucci"   (full player, filtered)
     function search(q: string): void { root.query = q; root.setExpanded(true) }
-    // omarchy-shell io.github.papershoes22.sclikes artist "Artist Name"   (full player, that artist's likes)
+    // omarchy-shell io.github.papershoes22.deepshuffle artist "Artist Name"   (full player, that artist's likes)
     function artist(name: string): void { root.artistFilter = name; root.setExpanded(true) }
-    // omarchy-shell io.github.papershoes22.sclikes playPause | next | prev | stop
+    // omarchy-shell io.github.papershoes22.deepshuffle playPause | next | prev | stop
     function playPause(): void { root.playPause() }
     function next(): void { root.next() }
     function prev(): void { root.prev() }
     function stop(): void { root.stop() }
-    // omarchy-shell io.github.papershoes22.sclikes playOn remote | here
+    // omarchy-shell io.github.papershoes22.deepshuffle playOn remote | here
     function playOn(where: string): void { root.playOn(where) }
     function togglePlayOn(): void { root.playOn(root.remoteMode ? "here" : "remote") }
   }
@@ -836,7 +836,7 @@ Panel {
       width: parent.width
       spacing: Style.space(6)
       Text {
-        text: root.remoteMode ? "The remote bridge isn't running" : "sclikes isn't running"
+        text: root.remoteMode ? "The remote bridge isn't running" : "deepshuffle isn't running"
         color: root.fg
         font.family: root.fontFamily
         font.pixelSize: Style.font.title
@@ -845,10 +845,10 @@ Panel {
         width: parent.width
         wrapMode: Text.WordWrap
         elide: Text.ElideNone
-        text: root.remoteMode ? "sclikes-remote.service relays this panel to " + root.remoteHost + "'s player over ssh."
-                           : "The player and archiver live in the sclikes user service."
+        text: root.remoteMode ? "deepshuffle-remote.service relays this panel to " + root.remoteHost + "'s player over ssh."
+                           : "The player and archiver live in the deepshuffle user service."
       }
-      Chip { label: root.remoteMode ? "Start sclikes-remote.service" : "Start sclikes.service"; onClicked: root.startDaemon() }
+      Chip { label: root.remoteMode ? "Start deepshuffle-remote.service" : "Start deepshuffle.service"; onClicked: root.startDaemon() }
     }
 
     // ---- Now playing
@@ -1736,7 +1736,7 @@ Panel {
           SmallText {
             anchors.centerIn: parent
             visible: !root.rowsLoading && trackModel.count === 0
-            text: root.daemonUp ? "No tracks match" : "sclikes isn't running"
+            text: root.daemonUp ? "No tracks match" : "deepshuffle isn't running"
           }
         }
       }
@@ -1777,7 +1777,7 @@ Panel {
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.namespace: "sclikes-bar-glow"
+    WlrLayershell.namespace: "deepshuffle-bar-glow"
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     readonly property bool atBottom: root.bar && root.bar.position === "bottom"
     anchors { top: !atBottom; bottom: atBottom; left: true; right: true }
@@ -1842,7 +1842,7 @@ Panel {
     color: "black"
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.namespace: "sclikes-screensaver"
+    WlrLayershell.namespace: "deepshuffle-screensaver"
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     anchors { top: true; bottom: true; left: true; right: true }
     mask: Region {}
@@ -2022,12 +2022,12 @@ Panel {
   FloatingWindow {
     id: playerWindow
     visible: false
-    title: "sclikes player"
+    title: "Deep Shuffle"
     color: Color.popups.background
     implicitWidth: Style.space(1160)
     implicitHeight: Style.space(720)
     minimumSize: Qt.size(Style.space(900), Style.space(520))
-    // Bigger UI on the laptop's built-in panel (it floats there, see hypr/sclikes.lua).
+    // Bigger UI on the laptop's built-in panel (it floats there, see hypr/deepshuffle.lua).
     readonly property string screenName: screen ? String(screen.name) : ""
     readonly property real uiScale: /^(eDP|LVDS|DSI)/.test(screenName) ? 1.3 : 1
 

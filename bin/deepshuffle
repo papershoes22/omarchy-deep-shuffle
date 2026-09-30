@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
-"""sclikes (Deep Shuffle for SoundCloud): a player for your SoundCloud likes, with an optional local archive.
+"""deepshuffle (Deep Shuffle for SoundCloud): a player for your SoundCloud likes, with an optional local archive.
 
 Setup:
-  sclikes config user <name>         your SoundCloud profile name (soundcloud.com/<name>)
-  sclikes config archive on|off      keep local copies of your likes (off by default: tracks stream)
-  sclikes config remote <ssh-host>   optional: another machine running sclikes, to play on from here
-  sclikes config                     show the settings (~/.config/sclikes/config.json)
+  deepshuffle config user <name>         your SoundCloud profile name (soundcloud.com/<name>)
+  deepshuffle config archive on|off      keep local copies of your likes (off by default: tracks stream)
+  deepshuffle config remote <ssh-host>   optional: another machine running deepshuffle, to play on from here
+  deepshuffle config                     show the settings (~/.config/deepshuffle/config.json)
 
 Commands:
-  sclikes sync [--full] [--export]   pull likes into the DB (incremental; --full reconciles unlikes,
+  deepshuffle sync [--full] [--export]   pull likes into the DB (incremental; --full reconciles unlikes,
                                      automatic when the last full sync is over 7 days old)
-  sclikes export [--format F]        write M3U / CSV / JSON of the library
-  sclikes stats                      counts by status
-  sclikes archive run [--limit N]    download queued tracks in the foreground
-  sclikes archive run --id ID        archive one specific track now
-  sclikes archive pause|resume       pause/resume the daemon's archive worker
-  sclikes archive retry              requeue failed tracks
-  sclikes audit [--fix] [--recheck]  verify files vs DB; --recheck re-queries gone/preview/failed tracks
-  sclikes daemon                     long-running worker: archive queue (thread) + player
-  sclikes play-on [here|remote]      where the music plays; on "remote" this machine is only the remote control
-                                     (sclikes-remote.service relays to the remote machine's daemon over ssh)
+  deepshuffle export [--format F]        write M3U / CSV / JSON of the library
+  deepshuffle stats                      counts by status
+  deepshuffle archive run [--limit N]    download queued tracks in the foreground
+  deepshuffle archive run --id ID        archive one specific track now
+  deepshuffle archive pause|resume       pause/resume the daemon's archive worker
+  deepshuffle archive retry              requeue failed tracks
+  deepshuffle audit [--fix] [--recheck]  verify files vs DB; --recheck re-queries gone/preview/failed tracks
+  deepshuffle daemon                     long-running worker: archive queue (thread) + player
+  deepshuffle play-on [here|remote]      where the music plays; on "remote" this machine is only the remote control
+                                     (deepshuffle-remote.service relays to the remote machine's daemon over ssh)
 
-Player (talks to the daemon over ~/.local/state/sclikes/ctl.sock; mpv --idle does the audio):
-  sclikes play [ID] [-q Q] [--artist A] [--genre G] [--view V] [--sort S] [--local] [--shuffle|--no-shuffle]
+Player (talks to the daemon over ~/.local/state/deepshuffle/ctl.sock; mpv --idle does the audio):
+  deepshuffle play [ID] [-q Q] [--artist A] [--genre G] [--view V] [--sort S] [--local] [--shuffle|--no-shuffle]
                                      no args: resume; ID/filters: build a new queue (liked order)
-  sclikes pause [--on|--off]         toggle (starts playback when stopped)
-  sclikes stop | next | prev
-  sclikes seek +10|-10|90|1:30|50%
-  sclikes vol +5|-5|60
-  sclikes shuffle [on|off|toggle]    sclikes repeat [off|all|one]
-  sclikes now [--json]               sclikes queue [-n N]
-  sclikes eq [PRESET] [--band N --gain DB]   10-band equalizer (live, saved)
+  deepshuffle pause [--on|--off]         toggle (starts playback when stopped)
+  deepshuffle stop | next | prev
+  deepshuffle seek +10|-10|90|1:30|50%
+  deepshuffle vol +5|-5|60
+  deepshuffle shuffle [on|off|toggle]    deepshuffle repeat [off|all|one]
+  deepshuffle now [--json]               deepshuffle queue [-n N]
+  deepshuffle eq [PRESET] [--band N --gain DB]   10-band equalizer (live, saved)
 
 Files:
-  ~/.local/share/sclikes/likes.db     SQLite library
-  ~/.local/state/sclikes/state.json   live state for the bar plugin
+  ~/.local/share/deepshuffle/likes.db     SQLite library
+  ~/.local/state/deepshuffle/state.json   live state for the bar plugin
   ~/Music/soundcloud/                 audio library: <Artist>/<Title> [<id>].<ext> + .jpg + .info.json
   ~/Music/soundcloud/_exports/        exports
 """
@@ -64,9 +64,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
-USERNAME = os.environ.get("SCLIKES_USER")  # overrides the config file's "user"
-PLUGIN_ID = "io.github.papershoes22.sclikes"
-CONFIG_PATH = HOME / ".config/sclikes/config.json"   # {"user": str, "archive": bool, "remote": ssh host}
+USERNAME = os.environ.get("DEEPSHUFFLE_USER")  # overrides the config file's "user"
+PLUGIN_ID = "io.github.papershoes22.deepshuffle"
+CONFIG_PATH = HOME / ".config/deepshuffle/config.json"   # {"user": str, "archive": bool, "remote": ssh host}
 CONFIG_DEFAULTS = {"user": "", "archive": False, "remote": ""}
 
 
@@ -82,11 +82,11 @@ def archiving_on():
     """Archiving is opt-in: with it off, likes stream from SoundCloud and nothing is downloaded,
     except tracks asked for one at a time with "Archive now"."""
     return bool(load_config()["archive"])
-DATA_DIR = HOME / ".local/share/sclikes"
+DATA_DIR = HOME / ".local/share/deepshuffle"
 DB_PATH = DATA_DIR / "likes.db"
 LIBRARY_DIR = HOME / "Music/soundcloud"
 EXPORT_DIR = LIBRARY_DIR / "_exports"
-STATE_DIR = HOME / ".local/state/sclikes"
+STATE_DIR = HOME / ".local/state/deepshuffle"
 STATE_PATH = STATE_DIR / "state.json"
 SYNC_STATE = STATE_DIR / "sync.json"  # written by `sync` (its own file: the daemon rewrites state.json every second)
 LOCK_PATH = STATE_DIR / "archive.lock"
@@ -319,7 +319,7 @@ def _sync(args):
     sc = SoundCloud()
     user = args.user or USERNAME or load_config()["user"]
     if not user:
-        raise SystemExit("no SoundCloud user set: run `sclikes config user <your-profile-name>`")
+        raise SystemExit("no SoundCloud user set: run `deepshuffle config user <your-profile-name>`")
     uid, total = sc.user_id(user)
     log(f"user {user} (id {uid}), {total} likes reported")
     known = {r[0] for r in con.execute("SELECT sc_id FROM tracks WHERE unliked=0")}
@@ -594,8 +594,8 @@ class ArchiveLock:
         try:
             fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            sys.exit("another archiver holds the lock (is the sclikes daemon running? "
-                     "use `sclikes archive pause`, or stop sclikes.service)")
+            sys.exit("another archiver holds the lock (is the deepshuffle daemon running? "
+                     "use `deepshuffle archive pause`, or stop deepshuffle.service)")
         return self
 
     def __exit__(self, *a):
@@ -724,7 +724,7 @@ def cmd_daemon(args):
             mpris = Mpris(player)
             mpris.start()
         except ImportError as e:
-            log(f"mpris: python-gobject missing ({e}); media keys won't reach sclikes")
+            log(f"mpris: python-gobject missing ({e}); media keys won't reach deepshuffle")
         viz = Visualizer()
         player.on_publish.append(viz.update)
         server = ControlServer(player)
@@ -859,7 +859,7 @@ class Mpv:
         MPV_SOCK.unlink(missing_ok=True)
         self.proc = subprocess.Popen(
             ["mpv", "--idle=yes", "--no-video", "--no-terminal", "--audio-display=no",
-             "--audio-client-name=sclikes", "--title=sclikes", f"--input-ipc-server={MPV_SOCK}",
+             "--audio-client-name=deepshuffle", "--title=deepshuffle", f"--input-ipc-server={MPV_SOCK}",
              f"--ytdl-format={STREAM_FORMAT}", f"--volume={volume}",
              "--load-scripts=no"]  # our own MPRIS server replaces mpv-mpris
             + ([f"--af={af}"] if af else []),
@@ -1180,7 +1180,7 @@ class Player:
         if not keep_error:
             self.error = None
         if not self.queue:
-            raise PlayerError("the queue is empty; try `sclikes play`")
+            raise PlayerError("the queue is empty; try `deepshuffle play`")
         if auto and self.repeat == "one" and step == 1 and self.fails == 0:
             return self._load(self.idx)
         nxt = self.idx + step
@@ -1445,7 +1445,7 @@ class Player:
 
 # ---------------------------------------------------------------- MPRIS
 
-MPRIS_NAME = "org.mpris.MediaPlayer2.sclikes"
+MPRIS_NAME = "org.mpris.MediaPlayer2.deepshuffle"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
 MPRIS_XML = """<node>
@@ -1542,7 +1542,7 @@ class Mpris:
         has_queue = snap.get("queue_len", 0) > 0
         md = {"mpris:trackid": ("o", NO_TRACK)}
         if t:
-            md = {"mpris:trackid": ("o", f"/sclikes/track/{t['sc_id']}"),
+            md = {"mpris:trackid": ("o", f"/deepshuffle/track/{t['sc_id']}"),
                   "mpris:length": ("x", int((snap.get("duration") or t.get("duration") or 0) * 1e6)),
                   "xesam:title": ("s", t.get("title") or ""),
                   "xesam:artist": ("as", [t.get("artist") or ""]),
@@ -1647,11 +1647,11 @@ class Mpris:
                 subprocess.Popen(["omarchy-shell", PLUGIN_ID, "expand"],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             elif method == "OpenUri":
-                return invocation.return_dbus_error("org.mpris.MediaPlayer2.sclikes.NotSupported",
+                return invocation.return_dbus_error("org.mpris.MediaPlayer2.deepshuffle.NotSupported",
                                                     "OpenUri is not supported")
             invocation.return_value(None)
         except (PlayerError, ValueError, OSError) as e:
-            invocation.return_dbus_error("org.mpris.MediaPlayer2.sclikes.Error", str(e))
+            invocation.return_dbus_error("org.mpris.MediaPlayer2.deepshuffle.Error", str(e))
 
 
 # ---------------------------------------------------------------- visualizer
@@ -1826,7 +1826,7 @@ def ctl(cmd, **args):
     try:
         s.connect(str(CTL_SOCK))
     except (FileNotFoundError, ConnectionRefusedError):
-        sys.exit("the sclikes daemon isn't running (systemctl --user start sclikes)")
+        sys.exit("the deepshuffle daemon isn't running (systemctl --user start deepshuffle)")
     s.settimeout(30)
     s.sendall(json.dumps({"cmd": cmd, "args": args}).encode() + b"\n")
     line = s.makefile("rb").readline()
@@ -1974,18 +1974,18 @@ def cmd_audit(args):
 # ---------------------------------------------------------------- remote: play on another machine
 
 # One machine can play while another is its remote control, e.g. a desktop with the good speakers,
-# driven from a laptop. `sclikes play-on remote` stops the local daemon and starts `sclikes remote`
-# (sclikes-remote.service), which stands in for it here: it relays ctl.sock to the other machine's
+# driven from a laptop. `deepshuffle play-on remote` stops the local daemon and starts `deepshuffle remote`
+# (deepshuffle-remote.service), which stands in for it here: it relays ctl.sock to the other machine's
 # daemon over ssh, mirrors that machine's state.json (plus its output volume) into the local one, and
 # owns the MPRIS name, so the panel, the CLI and the media keys all drive the remote player unchanged.
-# The remote machine runs a normal sclikes install; nothing else runs there beyond a small watcher
+# The remote machine runs a normal deepshuffle install; nothing else runs there beyond a small watcher
 # script piped over ssh.
 
 PLAY_ON = STATE_DIR / "play-on.json"      # {"on": "here"|"remote", "host": str, "busy": bool, "error": str}
-REMOTE_HOST = os.environ.get("SCLIKES_REMOTE") or load_config()["remote"]
+REMOTE_HOST = os.environ.get("DEEPSHUFFLE_REMOTE") or load_config()["remote"]
 REMOTE_SOCK = STATE_DIR / "remote.sock"   # local end of the ssh forward to the remote's ctl.sock
 REMOTE_SYNC_STATE = STATE_DIR / "sync-remote.json"
-REMOTE_ART = HOME / ".cache/sclikes/remote-art"
+REMOTE_ART = HOME / ".cache/deepshuffle/remote-art"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=2"]
 
@@ -1993,7 +1993,7 @@ SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveI
 # {"sync": ...} for sync.json, and {"sysvol": ...} when the output volume or mute changes.
 REMOTE_WATCHER = r"""
 import json, os, re, select, subprocess, time
-d = os.path.expanduser("~/.local/state/sclikes")
+d = os.path.expanduser("~/.local/state/deepshuffle")
 files = {"state": d + "/state.json", "sync": d + "/sync.json"}
 seen = {}
 def sysvol():
@@ -2111,8 +2111,8 @@ def cmd_play_on(args):
             link.symlink_to(os.path.realpath(units / unit))
     write_json_atomic(PLAY_ON, {**cur, "busy": True, "error": ""})
     if where == "remote" and not REMOTE_HOST:
-        write_json_atomic(PLAY_ON, {**cur, "busy": False, "error": "No remote set (sclikes config remote <ssh-host>)"})
-        sys.exit("no remote machine set: run `sclikes config remote <ssh-host>`")
+        write_json_atomic(PLAY_ON, {**cur, "busy": False, "error": "No remote set (deepshuffle config remote <ssh-host>)"})
+        sys.exit("no remote machine set: run `deepshuffle config remote <ssh-host>`")
     if where == "remote":
         ok = subprocess.run(["ssh", *SSH_OPTS, REMOTE_HOST, "true"], capture_output=True).returncode == 0
         if not ok:
@@ -2120,17 +2120,17 @@ def cmd_play_on(args):
             sys.exit(f"can't reach {REMOTE_HOST}; still playing {cur.get('on', 'here')}")
         if cur.get("on") != "remote":
             ctl_try("pause", on=True)  # this machine falls silent as the remote takes over
-        autostart("sclikes.service", False)
-        autostart("sclikes-remote.service", True)
+        autostart("deepshuffle.service", False)
+        autostart("deepshuffle-remote.service", True)
         systemctl("daemon-reload")
-        r = systemctl("start", "sclikes-remote.service")  # Conflicts= stops sclikes.service first
+        r = systemctl("start", "deepshuffle-remote.service")  # Conflicts= stops deepshuffle.service first
     else:
         if cur.get("on") == "remote":
             ctl_try("pause", on=True)  # don't leave the remote playing to an empty room
-        autostart("sclikes-remote.service", False)
-        autostart("sclikes.service", True)
+        autostart("deepshuffle-remote.service", False)
+        autostart("deepshuffle.service", True)
         systemctl("daemon-reload")
-        r = systemctl("start", "sclikes.service")  # Conflicts= stops sclikes-remote.service first
+        r = systemctl("start", "deepshuffle.service")  # Conflicts= stops deepshuffle-remote.service first
     err = "" if r.returncode == 0 else (r.stderr.strip() or "systemctl failed")
     write_json_atomic(PLAY_ON, {"on": where, "host": REMOTE_HOST, "busy": False, "error": err})
     print(("playing here" if where == "here" else f"playing on {REMOTE_HOST}") + (f" ({err})" if err else ""))
@@ -2272,7 +2272,7 @@ class RemoteBridge:
                     self.set_link(False, self.reason(err))
                     stop.wait(5)
                     continue
-                remote_ctl = f"{r.stdout}/.local/state/sclikes/ctl.sock"
+                remote_ctl = f"{r.stdout}/.local/state/deepshuffle/ctl.sock"
             REMOTE_SOCK.unlink(missing_ok=True)
             # Its own connection, never a shared ControlMaster one: a forward made through a shared
             # master vanishes when whichever client set it up first goes away.
@@ -2415,7 +2415,7 @@ def cmd_remote(args):
     stop = threading.Event()
     host = args.host or REMOTE_HOST
     if not host:
-        sys.exit("no remote machine set: run `sclikes config remote <ssh-host>`")
+        sys.exit("no remote machine set: run `deepshuffle config remote <ssh-host>`")
     bridge = RemoteBridge(host)
     bridge.write_state()
     server = RemoteProxy(bridge)
@@ -2446,12 +2446,12 @@ def cmd_remote(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="sclikes", description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="deepshuffle", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("sync", help="pull likes into the DB")
     s.add_argument("--full", action="store_true", help="walk all likes and flag unliked tracks")
-    s.add_argument("--user", help="SoundCloud profile name (default: `sclikes config user`)")
+    s.add_argument("--user", help="SoundCloud profile name (default: `deepshuffle config user`)")
     s.add_argument("--export", action="store_true", help="write exports afterwards")
     s.set_defaults(func=cmd_sync)
 
@@ -2485,8 +2485,8 @@ def main():
     po = sub.add_parser("play-on", help="play here, or on the remote machine with this one as its remote control")
     po.add_argument("where", nargs="?", choices=["here", "remote"])
     po.set_defaults(func=cmd_play_on)
-    rm = sub.add_parser("remote", help="stand-in daemon that relays to the remote machine (sclikes-remote.service)")
-    rm.add_argument("--host", help="ssh host (default: `sclikes config remote`, or $SCLIKES_REMOTE)")
+    rm = sub.add_parser("remote", help="stand-in daemon that relays to the remote machine (deepshuffle-remote.service)")
+    rm.add_argument("--host", help="ssh host (default: `deepshuffle config remote`, or $DEEPSHUFFLE_REMOTE)")
     rm.set_defaults(func=cmd_remote)
 
     pl = sub.add_parser("play", help="start/resume playback, or play a track/filter")

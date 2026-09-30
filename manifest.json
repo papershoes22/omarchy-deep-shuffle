@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.papershoes22.sclikes",
+  "id": "io.github.papershoes22.deepshuffle",
   "name": "Deep Shuffle for SoundCloud",
   "version": "0.1.0",
   "author": "papershoes22",
   "license": "MIT",
-  "description": "A player for your SoundCloud likes, in the bar. Its shuffle covers your entire likes library: every like has an equal chance and nothing repeats until you've heard them all, instead of cycling the recent likes a web page happens to have loaded. The pill shows what's playing, with a progress line; the dropdown has cover art, a scrubber, transport and volume, a 10-band EQ, what's up next, and a full library window with search. Optional: keep local copies of your likes (off by default), and play on another machine with this one as the remote. Runs in the bundled `sclikes` user service (mpv + yt-dlp).",
+  "description": "A player for your SoundCloud likes, in the bar. Its shuffle covers your entire likes library: every like has an equal chance and nothing repeats until you've heard them all, instead of cycling the recent likes a web page happens to have loaded. The pill shows what's playing, with a progress line; the dropdown has cover art, a scrubber, transport and volume, a 10-band EQ, what's up next, and a full library window with search. Optional: keep local copies of your likes (off by default), and play on another machine with this one as the remote. Runs in the bundled `deepshuffle` user service (mpv + yt-dlp).",
   "kinds": [
     "bar-widget"
   ],
@@ -21,7 +21,7 @@
       "music",
       "player",
       "likes",
-      "sclikes",
+      "deepshuffle",
       "mpv"
     ],
     "allowMultiple": false,
