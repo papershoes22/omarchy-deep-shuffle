@@ -79,7 +79,7 @@ chips at the bottom of the dropdown choose **All screens**, **External only** (n
 
 Needs `mpv`, `yt-dlp` and `ffmpeg`. Optional: `python-gobject` (media keys / MPRIS) and `cava` (visualizer).
 
-    omarchy plugin add https://github.com/papershoes22/omarchy-soundcloud-likes
+    omarchy plugin add https://github.com/papershoes22/omarchy-deep-shuffle
     P=~/.config/omarchy/plugins/io.github.papershoes22.deepshuffle
     mkdir -p ~/.local/bin ~/.config/systemd/user
     ln -s $P/bin/deepshuffle ~/.local/bin/deepshuffle
